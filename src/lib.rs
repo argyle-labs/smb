@@ -31,46 +31,26 @@ mod abi_export;
 /// primitive needs from us.
 pub const SMB_FSTYPES: &[&str] = &["cifs", "smb3", "smbfs"];
 
-#[derive(Debug)]
+/// SMB tool / transport errors. Expressed entirely through the orca-native
+/// `#[plugin_error]` abstraction — the plugin names no error crate; the macro
+/// emits `Display` + `std::error::Error` (with the `Io` source chain) + the
+/// `From<std::io::Error>` conversion.
+#[plugin_error]
 pub enum SmbError {
+    #[plugin(display = "required tool not found on PATH: {0}")]
     MissingTool(&'static str),
+    #[plugin(display = "smb tool failed: {tool} (exit {code:?}): {stderr}")]
     ToolFailed {
         tool: &'static str,
         code: Option<i32>,
         stderr: String,
     },
+    #[plugin(display = "io: {0}", from)]
     Io(std::io::Error),
+    #[plugin(display = "operation timed out after {0:?}")]
     Timeout(Duration),
+    #[plugin(display = "unsupported on this platform")]
     Unsupported,
-}
-
-impl std::fmt::Display for SmbError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SmbError::MissingTool(tool) => write!(f, "required tool not found on PATH: {tool}"),
-            SmbError::ToolFailed { tool, code, stderr } => {
-                write!(f, "smb tool failed: {tool} (exit {code:?}): {stderr}")
-            }
-            SmbError::Io(e) => write!(f, "io: {e}"),
-            SmbError::Timeout(d) => write!(f, "operation timed out after {d:?}"),
-            SmbError::Unsupported => write!(f, "unsupported on this platform"),
-        }
-    }
-}
-
-impl std::error::Error for SmbError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SmbError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for SmbError {
-    fn from(e: std::io::Error) -> Self {
-        SmbError::Io(e)
-    }
 }
 
 /// One share advertised by a server.
@@ -84,7 +64,7 @@ pub struct Share {
 
 #[plugin_struct]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[plugin(rename_all = "lowercase")]
 pub enum ShareKind {
     Disk,
     Ipc,
