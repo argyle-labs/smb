@@ -1,0 +1,44 @@
+[package]
+name = "smb"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "smb"
+path = "src/lib.rs"
+# `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it
+# as a normal Rust lib.
+crate-type = ["cdylib", "rlib"]
+
+# smb is a BACKEND-ONLY orca plugin: it carries zero `#[orca_tool]`s and instead
+# registers a `storage` StorageBackend across the cdylib FFI seam. Per
+# [[feedback-plugin-toolkit-only-no-exceptions]] it reaches the whole orca
+# system — infra AND the `storage` domain (`plugin_toolkit::storage`) — through
+# `plugin-toolkit` alone.
+#
+# Pinned to orca's `dev` branch. Until a consuming orca build resolves this git
+# source, the committed `[patch]` in `.cargo/config.toml` redirects it to the
+# local in-tree toolkit at ../orca.
+[dependencies]
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "dev" }
+
+# The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
+# `::abi_stable` paths in this crate's root (the cdylib FFI boundary the loader
+# dlopens), so it can't route through the toolkit. Pinned to the orca workspace
+# version (0.11) so the layout hash baked into the cdylib matches what orca's
+# plugin-loader checks at load time.
+abi_stable = "0.11"
+
+[dev-dependencies]
+# Dev-only: the in-crate test harness probes mount health against a `tempfile`
+# dir and drives the async smb tool wrappers under `#[tokio::test]`. `serde_json`
+# is reached through `plugin_toolkit::serde_json`, so it needs no direct dep.
+tempfile = "3"
+tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Match orca's workspace lint floor: discarding a Result/Option via
+# `let _ = ...` was a load-bearing past incident, so keep it a hard error here
+# too — the plugin must stay portable back into the orca workspace.
+[lints.clippy]
+let_underscore_must_use = "deny"
