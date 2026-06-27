@@ -19,8 +19,8 @@ use plugin_toolkit::async_trait;
 use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::storage::{
-    Capability, Health, MountEntry, MountOutcome, Share as StorageShare, StorageBackend,
-    StorageError, StorageKind, mount_table_of, probe_health,
+    mount_table_of, probe_health, Capability, Health, MountEntry, MountOutcome,
+    Share as StorageShare, StorageBackend, StorageError, StorageKind,
 };
 use plugin_toolkit::tokio::process::Command;
 
@@ -380,11 +380,9 @@ something invalid
         // Delegates to the shared primitive; on any platform it must return Ok
         // and contain only SMB-family fstypes (usually empty on CI).
         let mounts = list_mounts().expect("mount table readable");
-        assert!(
-            mounts
-                .iter()
-                .all(|m| SMB_FSTYPES.contains(&m.fstype.as_str()))
-        );
+        assert!(mounts
+            .iter()
+            .all(|m| SMB_FSTYPES.contains(&m.fstype.as_str())));
     }
 
     #[tokio::test]
