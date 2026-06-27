@@ -21,7 +21,7 @@ crate-type = ["cdylib", "rlib"]
 # source, the committed `[patch]` in `.cargo/config.toml` redirects it to the
 # local in-tree toolkit at ../orca.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "dev" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 # The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
 # `::abi_stable` paths in this crate's root (the cdylib FFI boundary the loader
