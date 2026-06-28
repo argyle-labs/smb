@@ -79,6 +79,11 @@ extern "C" fn manifest() -> RString {
 /// `parse_kind`/`parse_capability` accept. `invoke_prefix` is the family the
 /// `StorageProxy` calls back through.
 extern "C" fn backends() -> RString {
+    // `..Default::default()` keeps this literal forward-compatible: orca can add
+    // a new domain axis to `BackendDef` (as it did with the `deploy_target`
+    // `runtime` field) without breaking this storage plugin's compile. smb is a
+    // storage backend, so the deploy_target-only axes (`runtime`, …) stay at
+    // their empty defaults here.
     let def = BackendDef {
         domain: "storage".to_string(),
         name: BACKEND_NAME.to_string(),
@@ -86,6 +91,7 @@ extern "C" fn backends() -> RString {
         endpoint: "smb://local".to_string(),
         capabilities: vec!["list".to_string(), "unmount".to_string()],
         invoke_prefix: INVOKE_PREFIX.to_string(),
+        ..Default::default()
     };
     RString::from(sj::to_string(&[def]).unwrap_or_else(|_| "[]".to_string()))
 }
