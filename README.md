@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon-256.png" width="120" alt="smb" />
+</p>
+
 # smb — orca storage plugin
 
 An [orca](https://github.com/argyle-labs/orca) **backend-only** plugin. It
