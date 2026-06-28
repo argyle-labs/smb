@@ -764,6 +764,7 @@ dependencies = [
  "inventory",
  "macro-runtime",
  "moka",
+ "plugin-abi",
  "reqwest",
  "rusqlite",
  "schemars",
