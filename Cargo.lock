@@ -544,6 +544,7 @@ dependencies = [
  "contract",
  "derive",
  "dispatch",
+ "futures-util",
  "inventory",
  "macro-runtime",
  "notifications",
@@ -773,6 +774,19 @@ dependencies = [
  "toml",
  "tracing",
  "utils",
+]
+
+[[package]]
+name = "deploy-target"
+version = "0.0.8-rc.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -2149,6 +2163,7 @@ dependencies = [
  "containers",
  "contract",
  "db",
+ "deploy-target",
  "derive",
  "dispatch",
  "futures-core",
