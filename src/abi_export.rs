@@ -69,6 +69,15 @@ extern "C" fn orca_compat() -> RString {
 /// smb exposes zero `#[orca_tool]`s — it is a pure storage backend. The manifest
 /// is therefore the empty array, identical to what the loader's per-field
 /// default synthesizes; the plugin's whole surface crosses via [`backends`].
+/// smb declares no SQL tables — it reads the kernel mount table and registers a
+/// storage backend, holding no persistent state of its own. So `schemas()` is
+/// the empty declaration (identical to what the loader synthesizes for a plugin
+/// that predates the field). A stateful plugin would return a real `SchemaDecl`
+/// here and orca would migrate it into the plugin's isolated namespace on load.
+extern "C" fn schemas() -> RString {
+    RString::from(r#"{"namespace":"","tables":[]}"#)
+}
+
 extern "C" fn manifest() -> RString {
     RString::from("[]")
 }
@@ -79,6 +88,11 @@ extern "C" fn manifest() -> RString {
 /// `parse_kind`/`parse_capability` accept. `invoke_prefix` is the family the
 /// `StorageProxy` calls back through.
 extern "C" fn backends() -> RString {
+    // `..Default::default()` keeps this literal forward-compatible: orca can add
+    // a new domain axis to `BackendDef` (as it did with the `deploy_target`
+    // `runtime` field) without breaking this storage plugin's compile. smb is a
+    // storage backend, so the deploy_target-only axes (`runtime`, …) stay at
+    // their empty defaults here.
     let def = BackendDef {
         domain: "storage".to_string(),
         name: BACKEND_NAME.to_string(),
@@ -86,6 +100,7 @@ extern "C" fn backends() -> RString {
         endpoint: "smb://local".to_string(),
         capabilities: vec!["list".to_string(), "unmount".to_string()],
         invoke_prefix: INVOKE_PREFIX.to_string(),
+        ..Default::default()
     };
     RString::from(sj::to_string(&[def]).unwrap_or_else(|_| "[]".to_string()))
 }
@@ -167,6 +182,7 @@ fn export() -> PluginModRef {
         manifest,
         invoke,
         backends,
+        schemas,
     }
     .leak_into_prefix()
 }
