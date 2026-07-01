@@ -2,6 +2,10 @@
 name = "smb"
 version = "0.1.0"
 edition = "2021"
+description = "SMB/CIFS StorageBackend for orca's storage domain — backend-only plugin"
+
+[package.metadata.orca]
+category = "storage"
 
 [lib]
 name = "smb"
