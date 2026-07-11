@@ -13,7 +13,11 @@ path = "src/lib.rs"
 # `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
 # `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it
 # as a normal Rust lib.
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "smb"
+path = "src/main.rs"
 
 # smb is a BACKEND-ONLY orca plugin: it carries zero `#[orca_tool]`s and instead
 # registers a `storage` StorageBackend across the cdylib FFI seam. Per
@@ -28,11 +32,9 @@ crate-type = ["cdylib", "rlib"]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 # The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
-# `::abi_stable` paths in this crate's root (the cdylib FFI boundary the loader
 # dlopens), so it can't route through the toolkit. Pinned to the orca workspace
 # version (0.11) so the layout hash baked into the cdylib matches what orca's
 # plugin-loader checks at load time.
-abi_stable = "0.11"
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness probes mount health against a `tempfile`

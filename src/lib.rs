@@ -18,13 +18,11 @@ use std::time::Duration;
 use plugin_toolkit::async_trait;
 use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
     mount_table_of, probe_health, Capability, Health, MountEntry, MountOutcome,
     Share as StorageShare, StorageBackend, StorageError, StorageKind,
 };
-use plugin_toolkit::tokio::process::Command;
-
-mod abi_export;
 
 /// Filesystem types that denote an SMB/CIFS mount in the kernel mount table.
 /// This is the one piece of SMB-domain knowledge the generic mount-table
@@ -181,10 +179,10 @@ pub async fn list_shares(server: &str, credentials: &Credentials) -> Result<Vec<
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let output = Command::new("smbclient").args(&arg_refs).output().await?;
-    if !output.status.success() {
+    if !output.status.success {
         return Err(SmbError::ToolFailed {
             tool: "smbclient",
-            code: output.status.code(),
+            code: output.status.code,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
@@ -220,12 +218,12 @@ pub(crate) fn parse_smbclient_shares(raw: &str) -> Vec<Share> {
 
 async fn run_tool(tool: &'static str, args: &[&str]) -> Result<(), SmbError> {
     let out = Command::new(tool).args(args).output().await?;
-    if out.status.success() {
+    if out.status.success {
         Ok(())
     } else {
         Err(SmbError::ToolFailed {
             tool,
-            code: out.status.code(),
+            code: out.status.code,
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
