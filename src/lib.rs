@@ -21,7 +21,8 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
     mount_table_of, probe_health, Capability, Health, MountEntry, MountOutcome,
-    Share as StorageShare, StorageBackend, StorageError, StorageKind,
+    MountSpec as StorageMountSpec, MountStyle, NormalizedSpec, OptionSet, RecoverOutcome,
+    SecretRef, Share as StorageShare, SmbCredentials, StorageBackend, StorageError, StorageKind,
 };
 
 /// Filesystem types that denote an SMB/CIFS mount in the kernel mount table.
@@ -244,14 +245,343 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+// ── smb/cifs option grammar (Phase 3) ────────────────────────────────────────
+//
+// This backend owns the grammar of its own mount options. `validate_spec` parses
+// the store's raw comma-string into a typed `OptionSet::Smb`, rejecting malformed
+// values at declare time; `render_options` turns that typed set back into the
+// canonical cifs option string autofs consumes. The one non-negotiable property
+// (see the credential note on `render_smb_options`): an inline
+// username/password credential is NEVER rendered into the world-readable autofs
+// map — the password is a `SecretRef` the secrets domain resolves, and inline
+// credentials are referenced through a root-written `credentials=<path>` file.
+
+/// SMB protocol versions this backend accepts for the `vers=` mount option.
+/// mount.cifs accepts more (1.0, 2.0, 2.1, 3.0, 3.02, 3.1.1); we accept the
+/// modern, safe set and reject anything else at declare time so a typo surfaces
+/// before a mount is ever attempted.
+pub const SMB_VERSIONS: &[&str] = &["2.0", "2.1", "3.0", "3.1.1"];
+
+/// Deterministic path of the root-written cifs credentials file for a mount
+/// target. Inline credentials are materialized here (username/password/domain
+/// lines) by the privileged autofs seam so the secret never touches the
+/// world-readable autofs map; `render_smb_options` references this path via
+/// `credentials=<path>` instead of inline `user=`/`password=`.
+///
+/// The path is derived from the target so it is stable across renders (the
+/// on-disk diff stays a reliable drift check) and unique per mount. It lives
+/// under the same root-owned `/etc` tree the autofs map does.
+pub fn creds_file_path(target: &str) -> String {
+    // Sanitize the target into a flat, collision-resistant file name.
+    let slug: String = target
+        .trim_matches('/')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let slug = if slug.is_empty() {
+        "root".to_string()
+    } else {
+        slug
+    };
+    format!("/etc/orca/smb-creds/{slug}.creds")
+}
+
+/// Parse + validate a declarative [`StorageMountSpec`] into a typed [`OptionSet::Smb`].
+///
+/// Grammar accepted in the raw option string:
+///   * `vers=<v>`         — must be one of [`SMB_VERSIONS`]
+///   * `credentials=<p>`  — a creds-file path (File credential form)
+///   * `guest`            — anonymous mount (Guest credential form)
+///   * `username=<u>`     — inline username (Inline form; password from `SecretRef`)
+///   * `domain=<d>`       — inline domain (only valid alongside `username=`)
+///   * `uid=<u>` / `gid=<g>` / `iocharset=<c>` — mapping options
+///   * `noperm`           — client-side permission bypass flag
+///   * anything else      — passthrough, preserved in `extra`
+///
+/// Credential source resolution + validation (exactly one coherent form):
+///   * `credentials=<p>` present            → [`SmbCredentials::File`]
+///   * `guest` present                      → [`SmbCredentials::Guest`]
+///   * `username=` present + spec credential → [`SmbCredentials::Inline`]
+///     (the `credential` field carries the password `SecretRef`)
+///   * none of the above                    → default to Guest
+///
+/// Conflicting forms (e.g. `guest` + `credentials=`, or `username=` without a
+/// password `SecretRef`, or `credentials=` + `username=`) are rejected with a
+/// clear [`StorageError`].
+pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<OptionSet, StorageError> {
+    let raw = spec.options.as_deref().unwrap_or("");
+
+    let mut vers: Option<String> = None;
+    let mut creds_path: Option<String> = None;
+    let mut guest = false;
+    let mut username: Option<String> = None;
+    let mut domain: Option<String> = None;
+    let mut uid: Option<String> = None;
+    let mut gid: Option<String> = None;
+    let mut iocharset: Option<String> = None;
+    let mut noperm = false;
+    let mut extra: Vec<String> = Vec::new();
+
+    for opt in raw.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+        let (key, value) = match opt.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim().to_string())),
+            None => (opt, None),
+        };
+        match (key, value) {
+            ("vers", Some(v)) => {
+                if !SMB_VERSIONS.contains(&v.as_str()) {
+                    return Err(StorageError::Other(format!(
+                        "smb: unsupported vers `{v}` (accepted: {})",
+                        SMB_VERSIONS.join(", ")
+                    )));
+                }
+                vers = Some(v);
+            }
+            ("credentials", Some(v)) | ("cred", Some(v)) => creds_path = Some(v),
+            ("guest", None) => guest = true,
+            // `password`/`pass` must never be declared inline in the store — the
+            // password is a secrets-domain `SecretRef`, not a plaintext option.
+            ("password" | "pass", _) => {
+                return Err(StorageError::Other(
+                    "smb: inline `password=` is not allowed in the option string; \
+                     supply the password as a credential SecretRef"
+                        .to_string(),
+                ));
+            }
+            ("username" | "user", Some(v)) => username = Some(v),
+            ("domain" | "dom", Some(v)) => domain = Some(v),
+            ("uid", Some(v)) => uid = Some(v),
+            ("gid", Some(v)) => gid = Some(v),
+            ("iocharset", Some(v)) => iocharset = Some(v),
+            ("noperm", None) => noperm = true,
+            // Unknown-but-legal option: preserve it verbatim, order-stable.
+            _ => extra.push(opt.to_string()),
+        }
+    }
+
+    let credentials = resolve_smb_credentials(
+        creds_path,
+        guest,
+        username,
+        domain,
+        spec.credential.as_ref(),
+    )?;
+
+    Ok(OptionSet::Smb {
+        vers,
+        credentials,
+        uid,
+        gid,
+        iocharset,
+        noperm,
+        extra,
+    })
+}
+
+/// Reduce the parsed credential signals into exactly one coherent
+/// [`SmbCredentials`], rejecting conflicting combinations.
+fn resolve_smb_credentials(
+    creds_path: Option<String>,
+    guest: bool,
+    username: Option<String>,
+    domain: Option<String>,
+    credential: Option<&SecretRef>,
+) -> Result<SmbCredentials, StorageError> {
+    match (creds_path, guest, username) {
+        // More than one form declared at once — ambiguous, reject.
+        (Some(_), true, _) => Err(StorageError::Other(
+            "smb: `guest` and `credentials=` are mutually exclusive".to_string(),
+        )),
+        (Some(_), _, Some(_)) => Err(StorageError::Other(
+            "smb: `credentials=` (file) and `username=` (inline) are mutually exclusive"
+                .to_string(),
+        )),
+        (_, true, Some(_)) => Err(StorageError::Other(
+            "smb: `guest` and `username=` are mutually exclusive".to_string(),
+        )),
+        // File credential form.
+        (Some(path), false, None) => Ok(SmbCredentials::File { path }),
+        // Inline form: requires a password SecretRef from the spec's credential.
+        (None, false, Some(user)) => match credential {
+            Some(secret) => Ok(SmbCredentials::Inline {
+                username: user,
+                password: secret.clone(),
+                domain,
+            }),
+            None => Err(StorageError::Other(
+                "smb: inline `username=` requires a credential SecretRef for the password"
+                    .to_string(),
+            )),
+        },
+        // Explicit guest.
+        (None, true, None) => Ok(SmbCredentials::Guest),
+        // Nothing declared: default to an anonymous (guest) mount.
+        (None, false, None) => Ok(SmbCredentials::Guest),
+    }
+}
+
+/// Render a validated smb [`NormalizedSpec`] into the canonical cifs option
+/// string autofs consumes.
+///
+/// CREDENTIAL SAFETY (locked design decision): an inline username/password
+/// credential is NEVER rendered inline into the option string — the autofs map
+/// this feeds is world-readable. Instead the inline form is referenced through a
+/// root-written `credentials=<path>` file (see [`creds_file_path`]); the password
+/// (a [`SecretRef`]) is resolved by the secrets domain and written into that
+/// file by the privileged autofs seam, never by this renderer. The `File` form
+/// already references a creds-file, and `Guest` renders `guest`.
+///
+/// TODO(phase3-creds-seam): the core privileged autofs seam
+/// (`projects/system/src/autofs.rs`, `PrivilegedOp::Apply` + `is_allowed_write`)
+/// currently allowlists only the autofs map + master files; it cannot yet write
+/// an arbitrary root-owned creds-file. Until that seam is extended to (1)
+/// resolve the inline password `SecretRef` and (2) write `username=`/
+/// `password=`/`domain=` lines to `creds_file_path(target)` mode 0600 root-owned,
+/// an Inline credential is rendered here as a `credentials=<path>` REFERENCE to a
+/// file the seam does not yet materialize — so an inline-credential mount will not
+/// authenticate until that core follow-up lands. This is deliberate: referencing
+/// a not-yet-written creds-file is safe (the mount simply fails closed), whereas
+/// rendering `user=`/`password=` inline would leak the secret into the
+/// world-readable map. The `File` and `Guest` forms are fully functional today.
+pub fn render_smb_options(spec: &NormalizedSpec) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let OptionSet::Smb {
+        vers,
+        credentials,
+        uid,
+        gid,
+        iocharset,
+        noperm,
+        extra,
+    } = &spec.options
+    {
+        if let Some(v) = vers {
+            parts.push(format!("vers={v}"));
+        }
+        match credentials {
+            SmbCredentials::File { path } => parts.push(format!("credentials={path}")),
+            // Inline: reference the root-written creds-file, NEVER inline user/pass.
+            SmbCredentials::Inline { .. } => {
+                parts.push(format!("credentials={}", creds_file_path(&spec.target)));
+            }
+            SmbCredentials::Guest => parts.push("guest".to_string()),
+        }
+        if let Some(v) = uid {
+            parts.push(format!("uid={v}"));
+        }
+        if let Some(v) = gid {
+            parts.push(format!("gid={v}"));
+        }
+        if let Some(v) = iocharset {
+            parts.push(format!("iocharset={v}"));
+        }
+        if *noperm {
+            parts.push("noperm".to_string());
+        }
+        parts.extend(extra.iter().cloned());
+        return parts.join(",");
+    }
+    // A non-Smb option set (e.g. an un-migrated `Raw`) renders through the
+    // canonical shared renderer, preserving the declared string verbatim.
+    plugin_toolkit::storage::render_option_set(&spec.options)
+}
+
+// ── smb stale-session recovery (Phase 3) ─────────────────────────────────────
+//
+// SMB/CIFS has no stale-NFS-filehandle equivalent, but it does have dead-session
+// recovery: when a server drops a session (reboot, network blip) a `hard`-mounted
+// share wedges — I/O hangs and never idles out, exactly like a stale NFS mount.
+// The recovery shape mirrors the nfs plugin: probe each managed mount, and for any
+// that are stale/hung/missing, force-release (`umount -lf`) and retrigger so the
+// kernel re-establishes the session. Modeled on nfs's `recover_stale`.
+
+/// Force-release a wedged smb mount and retrigger it. `umount -lf` lazily detaches
+/// even a session that is hanging on a dead server (a plain `-l` will not release
+/// a `hard` cifs mount whose server is unreachable); the follow-up `stat` re-access
+/// prompts the kernel/automount to re-establish the session. Returns
+/// `(recovered, errors)`.
+pub async fn force_and_retrigger(
+    mountpoint: &Path,
+    health_timeout: Duration,
+) -> (bool, Vec<String>) {
+    let mut errors = Vec::new();
+    let mp = mountpoint.to_str().unwrap_or("");
+    if which("umount").is_some() {
+        if let Err(e) = run_tool("umount", &["-lf", "--", mp]).await {
+            errors.push(format!("release {mp}: {e}"));
+        }
+    } else {
+        errors.push("release: umount not found on PATH".to_string());
+    }
+    // Best-effort retrigger: accessing a direct-map mountpoint re-mounts it.
+    if which("stat").is_some() {
+        if let Err(e) = run_tool("stat", &["--", mp]).await {
+            errors.push(format!("retrigger {mp}: {e}"));
+        }
+    }
+    let recovered = health(mountpoint, health_timeout) == Health::Ok;
+    (recovered, errors)
+}
+
+/// Probe every live smb mount (optionally filtered to the `watch` prefixes),
+/// force-release + retrigger any that are stale/hung/missing, and report the
+/// outcome. Mirrors the nfs plugin's `recover_stale`: healthy and
+/// indeterminate-error probes are left untouched (never act on an ambiguous
+/// signal). Only a failure to read the kernel mount table is fatal.
+pub async fn recover_stale_mounts(
+    watch: &[String],
+    health_timeout: Duration,
+) -> Result<RecoverOutcome, SmbError> {
+    let mut out = RecoverOutcome::default();
+
+    let mounts = list_mounts()?;
+    for m in &mounts {
+        // Honor the watch prefix filter (empty = all), matching nfs semantics.
+        if !watch.is_empty()
+            && !watch
+                .iter()
+                .any(|w| match m.mountpoint.strip_prefix(w.as_str()) {
+                    Some("") => true,
+                    Some(rest) => rest.starts_with('/'),
+                    None => false,
+                })
+        {
+            continue;
+        }
+        let mp = Path::new(&m.mountpoint);
+        match health(mp, health_timeout) {
+            Health::Ok => {}
+            Health::Error => out.errors.push(format!(
+                "probe {}: indeterminate error, left untouched",
+                m.mountpoint
+            )),
+            Health::Stale | Health::Timeout | Health::Missing => {
+                let (recovered, errs) = force_and_retrigger(mp, health_timeout).await;
+                out.errors.extend(errs);
+                if recovered {
+                    out.recovered.push(m.mountpoint.clone());
+                } else {
+                    out.still_stale.push(m.mountpoint.clone());
+                }
+            }
+        }
+    }
+
+    out.no_stale_found = out.recovered.is_empty() && out.still_stale.is_empty();
+    Ok(out)
+}
+
 // ── storage domain backend ──────────────────────────────────────────────────
 
 /// SMB/CIFS network-share backend for the `storage` domain. Contributes the
-/// host's live SMB/CIFS mounts as shares and exposes unmount. Mount, list of
-/// server-advertised shares, and usage stay [`StorageError::Unsupported`] here:
-/// the storage-domain `mount`/`list_shares` operations take a single id/target,
-/// but driving an SMB mount needs a server + share + credentials ([`MountSpec`])
-/// which this thin descriptor cannot supply.
+/// host's live SMB/CIFS mounts as shares, exposes unmount, owns its option +
+/// credential grammar (`validate_spec` / `render_options`), and self-heals
+/// dead-session mounts (`recover_stale`).
+///
+/// Mount is left at the default [`StorageError::Unsupported`]: smb mounts are
+/// realized as kernel mounts through core's autofs applier (see
+/// [`StorageBackend::mount_style`] → [`MountStyle::KernelMount`]), not driven by
+/// this backend. Usage and server-share listing likewise stay unsupported here.
 pub struct SmbBackend {
     name: String,
 }
@@ -279,11 +609,39 @@ impl StorageBackend for SmbBackend {
     }
 
     fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::List, Capability::Unmount]
+        vec![
+            Capability::List,
+            Capability::Unmount,
+            Capability::RecoverStale,
+        ]
     }
 
     fn endpoint(&self) -> String {
         "smb://local".to_string()
+    }
+
+    fn mount_style(&self) -> MountStyle {
+        // smb mounts are kernel mounts driven through autofs / mount.cifs.
+        MountStyle::KernelMount
+    }
+
+    async fn validate_spec(&self, spec: &StorageMountSpec) -> Result<NormalizedSpec, StorageError> {
+        let options = validate_smb_options(spec)?;
+        Ok(NormalizedSpec {
+            backend: spec.backend.clone(),
+            target: spec.target.clone(),
+            fstype: spec.fstype.clone(),
+            source: spec.source.clone(),
+            failover_sources: spec.failover_sources.clone(),
+            options,
+            credential: spec.credential.clone(),
+            remount_policy: spec.remount_policy.clone(),
+            enabled: spec.enabled,
+        })
+    }
+
+    fn render_options(&self, spec: &NormalizedSpec) -> String {
+        render_smb_options(spec)
     }
 
     async fn list_shares(&self) -> Result<Vec<StorageShare>, StorageError> {
@@ -310,6 +668,16 @@ impl StorageBackend for SmbBackend {
             recovered: false,
             detail: None,
         })
+    }
+
+    async fn recover_stale(
+        &self,
+        watch: &[String],
+        health_timeout: Duration,
+    ) -> Result<RecoverOutcome, StorageError> {
+        recover_stale_mounts(watch, health_timeout)
+            .await
+            .map_err(|e| StorageError::Transport(e.to_string()))
     }
 }
 
@@ -474,5 +842,267 @@ something invalid
         // /sbin/mount is always present on macOS; assert the call returns Ok.
         let mounts = list_mounts().expect("/sbin/mount runs");
         let _ = mounts.len();
+    }
+
+    // ── smb option grammar (Phase 3) ──────────────────────────────────────
+
+    /// Build a `StorageMountSpec` for the option-grammar tests. `options` is the
+    /// raw declared cifs option string; `credential` is the password `SecretRef`
+    /// an inline mount carries.
+    fn smb_spec(options: Option<&str>, credential: Option<&str>) -> StorageMountSpec {
+        StorageMountSpec {
+            backend: "smb".into(),
+            target: "/mnt/media".into(),
+            fstype: "cifs".into(),
+            source: "//nas/media".into(),
+            failover_sources: vec![],
+            options: options.map(str::to_string),
+            credential: credential.map(|s| SecretRef(s.to_string())),
+            remount_policy: None,
+            enabled: true,
+        }
+    }
+
+    fn normalize(spec: &StorageMountSpec) -> NormalizedSpec {
+        let options = validate_smb_options(spec).expect("valid spec");
+        NormalizedSpec {
+            backend: spec.backend.clone(),
+            target: spec.target.clone(),
+            fstype: spec.fstype.clone(),
+            source: spec.source.clone(),
+            failover_sources: spec.failover_sources.clone(),
+            options,
+            credential: spec.credential.clone(),
+            remount_policy: spec.remount_policy.clone(),
+            enabled: spec.enabled,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_each_supported_vers() {
+        for v in SMB_VERSIONS {
+            let spec = smb_spec(Some(&format!("vers={v},guest")), None);
+            let set = validate_smb_options(&spec).expect("supported vers accepted");
+            match set {
+                OptionSet::Smb { vers, .. } => assert_eq!(vers.as_deref(), Some(*v)),
+                other => panic!("expected Smb option set, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_vers() {
+        let spec = smb_spec(Some("vers=9.9,guest"), None);
+        let err = validate_smb_options(&spec).expect_err("bad vers rejected");
+        assert!(err.to_string().contains("unsupported vers"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_guest() {
+        let spec = smb_spec(Some("vers=3.0,guest"), None);
+        let set = validate_smb_options(&spec).expect("guest accepted");
+        assert!(matches!(
+            set,
+            OptionSet::Smb {
+                credentials: SmbCredentials::Guest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_file_credentials() {
+        let spec = smb_spec(Some("vers=3.1.1,credentials=/etc/smb.creds,uid=1000"), None);
+        let set = validate_smb_options(&spec).expect("file creds accepted");
+        match set {
+            OptionSet::Smb {
+                credentials: SmbCredentials::File { path },
+                uid,
+                ..
+            } => {
+                assert_eq!(path, "/etc/smb.creds");
+                assert_eq!(uid.as_deref(), Some("1000"));
+            }
+            other => panic!("expected File credentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_inline_with_secret_ref() {
+        let spec = smb_spec(
+            Some("vers=3.0,username=svc,domain=WORKGROUP"),
+            Some("onepassword://vault/item"),
+        );
+        let set = validate_smb_options(&spec).expect("inline creds accepted");
+        match set {
+            OptionSet::Smb {
+                credentials:
+                    SmbCredentials::Inline {
+                        username,
+                        password,
+                        domain,
+                    },
+                ..
+            } => {
+                assert_eq!(username, "svc");
+                assert_eq!(password, SecretRef("onepassword://vault/item".into()));
+                assert_eq!(domain.as_deref(), Some("WORKGROUP"));
+            }
+            other => panic!("expected Inline credentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_defaults_to_guest_when_nothing_declared() {
+        let spec = smb_spec(Some("vers=3.0,uid=1000"), None);
+        let set = validate_smb_options(&spec).expect("defaults to guest");
+        assert!(matches!(
+            set,
+            OptionSet::Smb {
+                credentials: SmbCredentials::Guest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_inline_without_secret_ref() {
+        // username= with no password SecretRef is an incomplete inline form.
+        let spec = smb_spec(Some("username=svc"), None);
+        let err = validate_smb_options(&spec).expect_err("inline w/o secret rejected");
+        assert!(err.to_string().contains("SecretRef"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_inline_plaintext_password() {
+        // A plaintext password= in the option string is never allowed.
+        let spec = smb_spec(Some("username=svc,password=hunter2"), Some("secret://x"));
+        let err = validate_smb_options(&spec).expect_err("inline password rejected");
+        assert!(err.to_string().contains("password"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_conflicting_guest_and_file() {
+        let spec = smb_spec(Some("guest,credentials=/etc/smb.creds"), None);
+        let err = validate_smb_options(&spec).expect_err("guest+file rejected");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_conflicting_file_and_inline() {
+        let spec = smb_spec(
+            Some("credentials=/etc/smb.creds,username=svc"),
+            Some("secret://x"),
+        );
+        let err = validate_smb_options(&spec).expect_err("file+inline rejected");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_preserves_unknown_options_in_extra() {
+        let spec = smb_spec(Some("guest,seal,cache=strict"), None);
+        let set = validate_smb_options(&spec).expect("passthrough accepted");
+        match set {
+            OptionSet::Smb { extra, .. } => {
+                assert!(extra.contains(&"seal".to_string()));
+                assert!(extra.contains(&"cache=strict".to_string()));
+            }
+            other => panic!("expected Smb option set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_file_credentials_references_the_path() {
+        let spec = normalize(&smb_spec(
+            Some("vers=3.0,credentials=/etc/smb.creds,uid=1000,noperm"),
+            None,
+        ));
+        let rendered = render_smb_options(&spec);
+        assert_eq!(
+            rendered,
+            "vers=3.0,credentials=/etc/smb.creds,uid=1000,noperm"
+        );
+    }
+
+    #[test]
+    fn render_guest_emits_guest() {
+        let spec = normalize(&smb_spec(Some("vers=3.1.1,guest"), None));
+        assert_eq!(render_smb_options(&spec), "vers=3.1.1,guest");
+    }
+
+    #[test]
+    fn render_inline_references_creds_file_never_plaintext() {
+        // The locked property: an inline credential renders a `credentials=<path>`
+        // REFERENCE — never inline `user=`/`username=`/`password=`, and never the
+        // password SecretRef itself, into the world-readable autofs map.
+        let secret = "onepassword://vault/smb-svc";
+        let spec = normalize(&smb_spec(
+            Some("vers=3.0,username=svc,domain=WORKGROUP,uid=1000"),
+            Some(secret),
+        ));
+        let rendered = render_smb_options(&spec);
+
+        // References the deterministic root-written creds-file.
+        assert!(
+            rendered.contains(&format!("credentials={}", creds_file_path("/mnt/media"))),
+            "expected creds-file reference, got: {rendered}"
+        );
+        // NEVER any inline credential material.
+        assert!(!rendered.contains("password="), "no inline password=");
+        assert!(!rendered.contains("username="), "no inline username=");
+        assert!(!rendered.contains("user="), "no inline user=");
+        assert!(!rendered.contains("domain="), "no inline domain=");
+        // NEVER the secret ref / any secret scheme.
+        assert!(!rendered.contains(secret), "secret ref must not render");
+        assert!(!rendered.contains("onepassword"), "no secret scheme leak");
+        // Non-secret typed options still render.
+        assert!(rendered.contains("vers=3.0"));
+        assert!(rendered.contains("uid=1000"));
+    }
+
+    #[test]
+    fn creds_file_path_is_deterministic_and_under_root_tree() {
+        let p = creds_file_path("/mnt/media");
+        assert_eq!(p, "/etc/orca/smb-creds/mnt-media.creds");
+        // Stable across calls.
+        assert_eq!(p, creds_file_path("/mnt/media"));
+    }
+
+    #[tokio::test]
+    async fn validate_spec_backend_method_normalizes_to_typed_smb() {
+        let backend = SmbBackend::new("smb");
+        let spec = smb_spec(Some("vers=3.0,guest,uid=1000"), None);
+        let normalized = backend.validate_spec(&spec).await.expect("validate");
+        assert!(matches!(normalized.options, OptionSet::Smb { .. }));
+        assert_eq!(
+            backend.render_options(&normalized),
+            "vers=3.0,guest,uid=1000"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_spec_backend_method_rejects_bad_vers() {
+        let backend = SmbBackend::new("smb");
+        let spec = smb_spec(Some("vers=1.5,guest"), None);
+        assert!(backend.validate_spec(&spec).await.is_err());
+    }
+
+    #[test]
+    fn mount_style_is_kernel_mount() {
+        assert_eq!(SmbBackend::default().mount_style(), MountStyle::KernelMount);
+    }
+
+    #[test]
+    fn capabilities_include_recover_stale() {
+        let caps = SmbBackend::default().capabilities();
+        assert!(caps.contains(&Capability::RecoverStale));
+        assert!(caps.contains(&Capability::List));
+        assert!(caps.contains(&Capability::Unmount));
+    }
+
+    #[test]
+    fn recover_outcome_default_is_no_stale() {
+        let o = RecoverOutcome::default();
+        assert!(o.recovered.is_empty() && o.still_stale.is_empty());
     }
 }

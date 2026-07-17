@@ -25,9 +25,11 @@ path = "src/main.rs"
 # system — infra AND the `storage` domain (`plugin_toolkit::storage`) — through
 # `plugin-toolkit` alone.
 #
-# Pinned to orca's `dev` branch. Until a consuming orca build resolves this git
-# source, the committed `[patch]` in `.cargo/config.toml` redirects it to the
-# local in-tree toolkit at ../orca.
+# The typed mount contract this plugin implements (StorageBackend::validate_spec
+# / render_options / mount_style, MountSpec / NormalizedSpec / OptionSet::Smb /
+# SmbCredentials / SecretRef / register_from_def_styled) landed on orca `main`
+# via PR #121, so the dep points back at the git source rather than a local
+# checkout.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
