@@ -25,11 +25,22 @@ path = "src/main.rs"
 # system — infra AND the `storage` domain (`plugin_toolkit::storage`) — through
 # `plugin-toolkit` alone.
 #
-# Pinned to orca's `dev` branch. Until a consuming orca build resolves this git
-# source, the committed `[patch]` in `.cargo/config.toml` redirects it to the
-# local in-tree toolkit at ../orca.
+# TODO(phase3-dep-flip): temporarily a direct local path dependency because the
+# typed mount contract this plugin now implements
+# (StorageBackend::validate_spec / render_options / mount_style, MountSpec /
+# NormalizedSpec / OptionSet::Smb / SmbCredentials / SecretRef /
+# register_from_def_styled) lives on orca branch
+# `feat/storage-mount-contract-phase1` (PR #121) and is NOT yet on `main` (and is
+# not currently pushed as a resolvable remote git ref). The prior
+# `git = "…/orca", branch = "main"` + `[patch]`-to-local mechanism cannot be used
+# here: local orca is plugin-toolkit 0.1.1-rc.21 while `main` still resolves
+# 0.1.1-rc.9, and cargo refuses a cross-prerelease `[patch]`, so the patch is
+# silently dropped and the phase1 symbols never resolve. Pointing directly at the
+# local phase1 checkout is the only mechanism that compiles until #121 merges.
+# FLIP THIS BACK to `{ git = "https://github.com/argyle-labs/orca",
+# branch = "main" }` (or a released tag) once PR #121 lands on main.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { path = "../orca/projects/plugin-toolkit" }
 
 # The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
 # dlopens), so it can't route through the toolkit. Pinned to the orca workspace
