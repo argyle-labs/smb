@@ -31,7 +31,7 @@ path = "src/main.rs"
 # via PR #121, so the dep points back at the git source rather than a local
 # checkout.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.1-rc.22" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.1-rc.47" }
 
 # The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
 # dlopens), so it can't route through the toolkit. Pinned to the orca workspace
