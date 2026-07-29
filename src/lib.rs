@@ -253,9 +253,10 @@ fn urlencode(s: &str) -> String {
 // ── smb/cifs option grammar (Phase 3) ────────────────────────────────────────
 //
 // This backend owns the grammar of its own mount options. `validate_spec` parses
-// the store's raw comma-string into a typed `OptionSet::Smb`, rejecting malformed
-// values at declare time; `render_options` turns that typed set back into the
-// canonical cifs option string autofs consumes. The one non-negotiable property
+// the store's raw comma-string into a local typed `SmbOptions`, rejecting malformed
+// values at declare time, then hands core the rendered string as an opaque
+// `OptionSet::Raw`; `render_options` reproduces the canonical cifs option string
+// autofs consumes. Core never parses this grammar. The one non-negotiable property
 // (see the credential note on `render_smb_options`): an inline
 // username/password credential is NEVER rendered into the world-readable autofs
 // map — the password is a `SecretRef` the secrets domain resolves, and inline
@@ -757,9 +758,9 @@ impl StorageBackend for SmbBackend {
 }
 
 /// Register the smb storage backend with the process-global `storage` registry.
-/// Retained for the `rlib` shape (in-process embedding / tests); the cdylib
-/// plugin path contributes the backend via [`abi_export`]'s `backends()` seam
-/// instead, so a `dlopen`ing orca never calls this.
+/// Retained for the `rlib` shape (in-process embedding / tests); the runnable
+/// plugin is the subprocess `[[bin]]`, which serves the backend directly via
+/// `plugin_toolkit::serve_storage_plugin!` (see `main.rs`) and never calls this.
 pub fn bootstrap() {
     plugin_toolkit::storage::register_backend(Arc::new(SmbBackend::default()));
 }

@@ -10,9 +10,9 @@ category = "storage"
 [lib]
 name = "smb"
 path = "src/lib.rs"
-# `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
-# `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it
-# as a normal Rust lib.
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it as
+# a normal Rust lib. The runnable plugin is the `[[bin]]` below — the cdylib
+# export was retired (#11); smb runs as a subprocess over the orca socket.
 crate-type = ["rlib"]
 
 [[bin]]
@@ -20,26 +20,22 @@ name = "smb"
 path = "src/main.rs"
 
 # smb is a BACKEND-ONLY orca plugin: it carries zero `#[orca_tool]`s and instead
-# registers a `storage` StorageBackend across the cdylib FFI seam. Per
+# registers a `storage` StorageBackend, served as a subprocess `[[bin]]` over the
+# orca socket (`plugin_toolkit::serve_storage_plugin!`). Per
 # [[feedback-plugin-toolkit-only-no-exceptions]] it reaches the whole orca
 # system — infra AND the `storage` domain (`plugin_toolkit::storage`) — through
-# `plugin-toolkit` alone.
+# `plugin-toolkit` alone; it has no other non-orca dependency.
 #
-# The typed mount contract this plugin implements (StorageBackend::validate_spec
-# / render_options / mount_style, MountSpec / NormalizedSpec / OptionSet::Smb /
-# SmbCredentials / SecretRef / register_from_def_styled) landed on orca `main`
-# via PR #121, so the dep points back at the git source rather than a local
-# checkout.
+# The typed mount contract it implements (StorageBackend::validate_spec /
+# render_options / mount_style, MountSpec / NormalizedSpec / SecretRef /
+# register_from_def_styled) is reached through `plugin-toolkit`. This backend
+# owns its own SMB option + credential grammar and hands core only the opaque
+# `OptionSet::Raw` string plus a generic `SecretFile`.
 [dependencies]
-# TEMP: points at the core branch that genericizes the secret-file seam
-# (SMB_CREDS_DIR/creds_file_path -> SECRET_FILE_DIR/secret_file_path, orca#195).
-# Re-pin to the release tag carrying that change before merge.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "refactor/generic-secret-file-seam" }
-
-# The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
-# dlopens), so it can't route through the toolkit. Pinned to the orca workspace
-# version (0.11) so the layout hash baked into the cdylib matches what orca's
-# plugin-loader checks at load time.
+# TEMP: tracks orca `main` (carries the genericized secret-file seam,
+# SECRET_FILE_DIR/secret_file_path — orca#195, merged). Re-pin to the release tag
+# that first carries #195 once it is cut.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness probes mount health against a `tempfile`
