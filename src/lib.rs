@@ -20,7 +20,7 @@ use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
-    creds_file_path, is_valid_creds_file_path, mount_table_of, parse_option_string, probe_health,
+    is_valid_secret_file_path, mount_table_of, parse_option_string, probe_health, secret_file_path,
     Capability, Health, MountEntry, MountOutcome, MountSpec as StorageMountSpec, MountStyle,
     NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome, SecretFile, SecretRef,
     Share as StorageShare, StorageBackend, StorageError, StorageKind,
@@ -32,29 +32,29 @@ use plugin_toolkit::storage::{
 pub const SMB_FSTYPES: &[&str] = &["cifs", "smb3", "smbfs"];
 
 /// SMB tool / transport errors. Expressed entirely through the orca-native
-/// `#[plugin_error]` abstraction — the plugin names no error crate; the macro
+/// `#[orca_error]` abstraction — the plugin names no error crate; the macro
 /// emits `Display` + `std::error::Error` (with the `Io` source chain) + the
 /// `From<std::io::Error>` conversion.
-#[plugin_error]
+#[orca_error]
 pub enum SmbError {
-    #[plugin(display = "required tool not found on PATH: {0}")]
+    #[orca(display = "required tool not found on PATH: {0}")]
     MissingTool(&'static str),
-    #[plugin(display = "smb tool failed: {tool} (exit {code:?}): {stderr}")]
+    #[orca(display = "smb tool failed: {tool} (exit {code:?}): {stderr}")]
     ToolFailed {
         tool: &'static str,
         code: Option<i32>,
         stderr: String,
     },
-    #[plugin(display = "io: {0}", from)]
+    #[orca(display = "io: {0}", from)]
     Io(std::io::Error),
-    #[plugin(display = "operation timed out after {0:?}")]
+    #[orca(display = "operation timed out after {0:?}")]
     Timeout(Duration),
-    #[plugin(display = "unsupported on this platform")]
+    #[orca(display = "unsupported on this platform")]
     Unsupported,
 }
 
 /// One share advertised by a server.
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Share {
     pub name: String,
@@ -62,9 +62,9 @@ pub struct Share {
     pub comment: String,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[plugin(rename_all = "lowercase")]
+#[orca(rename_all = "lowercase")]
 pub enum ShareKind {
     Disk,
     Ipc,
@@ -456,7 +456,7 @@ fn resolve_smb_credentials(
 /// mount `-o` string it feeds may be world-readable. Instead the inline form is
 /// referenced through a root-written `credentials=<path>` file (the generic
 /// [`SecretFile`] the backend hands core via
-/// [`plugin_toolkit::storage::creds_file_path`]); the password (a [`SecretRef`])
+/// [`plugin_toolkit::storage::secret_file_path`]); the password (a [`SecretRef`])
 /// is resolved and its plaintext written into that file by core's privileged 0600
 /// writer, never by this renderer. The `File` form already references a
 /// creds-file, and `Guest` renders `guest`.
@@ -472,7 +472,7 @@ pub fn render_smb_options(o: &SmbOptions, target: &str) -> String {
         }
         // Inline: reference the root-written creds-file, NEVER inline user/pass.
         SmbCredentials::Inline { .. } => {
-            b.opt("credentials", Some(&creds_file_path(target)));
+            b.opt("credentials", Some(&secret_file_path(target)));
         }
         SmbCredentials::Guest => {
             b.opt("guest", None);
@@ -493,8 +493,8 @@ pub fn render_smb_options(o: &SmbOptions, target: &str) -> String {
 
 /// Build the generic [`SecretFile`] for an inline-credential mount: resolve the
 /// password [`SecretRef`] to plaintext, render the cifs creds-file contents, and
-/// point it at the core-owned deterministic [`creds_file_path`] (which
-/// [`is_valid_creds_file_path`] round-trips, so core's allowlist admits the
+/// point it at the core-owned deterministic [`secret_file_path`] (which
+/// [`is_valid_secret_file_path`] round-trips, so core's allowlist admits the
 /// write). Returns `None` for File/Guest credentials (no secret to materialize)
 /// or (fail-closed) if the SecretRef cannot be resolved — the mount then
 /// references a creds-file that does not exist and simply fails to authenticate,
@@ -512,8 +512,8 @@ fn build_secret_file(o: &SmbOptions, target: &str) -> Option<SecretFile> {
         Ok(p) => p,
         Err(_) => return None, // fail closed — never log the ref's value
     };
-    let path = creds_file_path(target);
-    if !is_valid_creds_file_path(&path) {
+    let path = secret_file_path(target);
+    if !is_valid_secret_file_path(&path) {
         return None;
     }
     Some(SecretFile {
@@ -1081,10 +1081,10 @@ something invalid
             Some(secret),
         ));
 
-        // References the deterministic core-owned root-written creds-file.
+        // References the deterministic core-owned root-written secret-file.
         assert!(
-            rendered.contains(&format!("credentials={}", creds_file_path("/mnt/media"))),
-            "expected creds-file reference, got: {rendered}"
+            rendered.contains(&format!("credentials={}", secret_file_path("/mnt/media"))),
+            "expected secret-file reference, got: {rendered}"
         );
         // NEVER any inline credential material.
         assert!(!rendered.contains("password="), "no inline password=");
@@ -1100,12 +1100,12 @@ something invalid
     }
 
     #[test]
-    fn creds_file_path_uses_core_slug_convention() {
-        // The plugin references core's deterministic creds-file path so the
-        // privileged allowlist (`is_valid_creds_file_path`) round-trips.
-        let p = creds_file_path("/mnt/media");
-        assert_eq!(p, "/etc/orca/smb-creds/mnt_media.creds");
-        assert!(is_valid_creds_file_path(&p));
+    fn secret_file_path_uses_core_slug_convention() {
+        // The plugin references core's deterministic secret-file path so the
+        // privileged allowlist (`is_valid_secret_file_path`) round-trips.
+        let p = secret_file_path("/mnt/media");
+        assert_eq!(p, "/etc/orca/secret-files/mnt_media.secret");
+        assert!(is_valid_secret_file_path(&p));
     }
 
     #[tokio::test]
