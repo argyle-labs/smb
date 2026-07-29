@@ -1,6 +1,5 @@
 # The orca repo is private. Use the git CLI (which inherits the operator's
 # authenticated gh / ssh credentials) so cargo can resolve the `plugin-toolkit`
-# git source pinned in Cargo.toml (orca `main`, which carries the phase1
-# storage-mount contract as of PR #121).
+# git source pinned in Cargo.toml.
 [net]
 git-fetch-with-cli = true
