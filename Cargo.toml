@@ -31,10 +31,10 @@ path = "src/main.rs"
 # via PR #121, so the dep points back at the git source rather than a local
 # checkout.
 [dependencies]
-# TEMP: points at the core branch that genericizes the secret-file seam
-# (SMB_CREDS_DIR/creds_file_path -> SECRET_FILE_DIR/secret_file_path, orca#195).
-# Re-pin to the release tag carrying that change before merge.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "refactor/generic-secret-file-seam" }
+# TEMP: tracks orca `main` (carries the genericized secret-file seam,
+# SECRET_FILE_DIR/secret_file_path — orca#195, merged). Re-pin to the release tag
+# that first carries #195 before merge.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 # The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
 # dlopens), so it can't route through the toolkit. Pinned to the orca workspace
