@@ -11,8 +11,8 @@ category = "storage"
 name = "smb"
 path = "src/lib.rs"
 # `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it as
-# a normal Rust lib. The runnable plugin is the `[[bin]]` below — the cdylib
-# export was retired (#11); smb runs as a subprocess over the orca socket.
+# a normal Rust lib. The runnable plugin is the `[[bin]]` below: smb runs as a
+# subprocess over the orca socket.
 crate-type = ["rlib"]
 
 [[bin]]

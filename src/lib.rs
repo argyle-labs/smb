@@ -222,7 +222,7 @@ async fn run_tool(tool: &'static str, args: &[&str]) -> Result<(), SmbError> {
     // Generic "shell out, fail on non-zero" mechanism (core); map its ToolError
     // into this plugin's own SmbError. `tool` stays a `&'static str` for the
     // error variant, so the ToolError's own tool string is discarded in favor of
-    // it (identical to the prior behavior).
+    // it.
     Command::new(tool)
         .args(args)
         .run_checked()
