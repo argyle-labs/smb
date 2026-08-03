@@ -23,5 +23,5 @@ orca drives this plugin through its generic surface — rich, smb-specific data 
 
 ## Layout
 
-- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
+- `src/` — the plugin (pure Rust): the `SmbBackend` `StorageBackend` descriptor + `validate_spec` / `mount` / `unmount` / `list_shares`.
 - `assets/` — plugin icon.
