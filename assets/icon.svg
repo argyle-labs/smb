@@ -12,6 +12,23 @@
     </pattern>
   </defs>
   <g clip-path="url(#tile)"><rect x="16" y="16" width="480" height="480" fill="url(#argyle)"/></g>
-  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2BD3D3" stroke-width="6"/>
-  <g fill="#C89A7C"><rect x="156" y="160" width="200" height="128" rx="16"/><rect x="186" y="300" width="140" height="20" rx="8"/><path d="M246 288 h20 v18 h-20 z"/><g fill="none" stroke="#C89A7C" stroke-width="12" stroke-linecap="round"><path d="M196 340 h120"/></g><circle cx="220" cy="350" r="10"/><circle cx="292" cy="350" r="10"/><rect x="186" y="196" width="140" height="14" rx="7" fill="#170F08"/><rect x="186" y="226" width="100" height="14" rx="7" fill="#170F08"/></g>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#C89A7C" stroke-width="6"/>
+
+  <!-- mapped network share: a monitor displaying a shared folder -->
+  <g stroke="#170F08" stroke-width="7" stroke-linejoin="round">
+    <rect x="138" y="150" width="236" height="154" rx="18" fill="#C89A7C"/>
+    <rect x="160" y="172" width="192" height="110" rx="8" fill="#241609" stroke="none"/>
+    <rect x="242" y="304" width="28" height="22" fill="#C89A7C"/>
+    <rect x="190" y="324" width="132" height="16" rx="8" fill="#C89A7C"/>
+  </g>
+  <!-- shared folder on the display, with broadcast arcs (shared over network) -->
+  <g stroke="#170F08" stroke-width="5" stroke-linejoin="round">
+    <path d="M188 210 Q188 202 196 202 L230 202 Q235 202 238 206 L245 214 L286 214
+             Q294 214 294 222 L294 258 Q294 266 286 266 L196 266 Q188 266 188 258 Z"
+          fill="#E7C9AE"/>
+  </g>
+  <g fill="none" stroke="#E7C9AE" stroke-width="6" stroke-linecap="round">
+    <path d="M304 236 a18 18 0 0 1 18 18"/>
+    <path d="M304 220 a34 34 0 0 1 34 34"/>
+  </g>
 </svg>
