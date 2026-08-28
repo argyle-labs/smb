@@ -167,7 +167,7 @@ pub async fn unmount(mountpoint: &Path) -> Result<(), SmbError> {
 /// List shares advertised by `server` via `smbclient -L //server`.
 pub async fn list_shares(server: &str, credentials: &Credentials) -> Result<Vec<Share>, SmbError> {
     which("smbclient").ok_or(SmbError::MissingTool("smbclient"))?;
-    let mut args: Vec<String> = vec![format!("-L"), format!("//{server}"), "-g".into()];
+    let mut args: Vec<String> = vec!["-L".into(), format!("//{server}"), "-g".into()];
     match credentials {
         Credentials::Guest => args.push("-N".into()),
         Credentials::Inline { username, password } => {
