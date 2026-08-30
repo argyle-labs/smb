@@ -1,18 +1,78 @@
 name: CI
 
+# Inlined plugin CI gate: test + lint ONLY (no binary builds — those live in
+# release.yml). Previously this delegated to the org reusable
+# argyle-labs/.github → plugin-ci.yml via a job-level `uses:`. Forgejo renders a
+# reusable-workflow call as TWO status rows (the wrapper `ci` job + the reusable
+# `test` job), which reads as "CI running twice" even though cargo runs once.
+# Inlining the steps here yields a SINGLE required check. Keep in sync with the
+# org reusable if that ever changes (the steps are a verbatim copy).
+
 on:
-  # Pre-merge gate only: runs on pull_request (+ manual dispatch). Deliberately
-  # NOT on push to main — re-running the suite on the post-merge push is pure
-  # double-work (the PR already proved that exact tree green). Main is protected
-  # by requiring green PRs. Mirrors the orca repo's CI trigger policy.
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Shared sccache → MinIO S3 on frigg (10.10.10.31). CARGO_INCREMENTAL=0 is
+  # mandatory — sccache and incremental compilation are mutually exclusive.
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: sccache
+  SCCACHE_ENDPOINT: 10.10.10.31:9000
+  SCCACHE_S3_USE_SSL: "false"
+  SCCACHE_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+
 jobs:
-  ci:
-    uses: argyle-labs/.github/.github/workflows/plugin-ci.yml@main
-    secrets: inherit
+  # Unit/integration tests + lint. The single required check.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Install sccache
+        run: |
+          set -euo pipefail
+          ver=v0.8.2
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${ver}/sccache-${ver}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache'
+          chmod +x /usr/local/bin/sccache
+          sccache --version
+
+      - name: Drop local-dev cargo patch
+        run: rm -f .cargo/config.toml
+
+      - name: Authenticate private orca git dependency (Gitea)
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.ORCA_FETCH_TOKEN }}@gitea.scottkey.me/".insteadOf \
+            "https://github.com/"
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features --workspace
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
