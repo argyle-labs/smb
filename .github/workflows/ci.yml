@@ -1,10 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # Pre-merge gate only: runs on pull_request (+ manual dispatch). Deliberately
+  # NOT on push to main — re-running the suite on the post-merge push is pure
+  # double-work (the PR already proved that exact tree green). Main is protected
+  # by requiring green PRs. Mirrors the orca repo's CI trigger policy.
   pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
