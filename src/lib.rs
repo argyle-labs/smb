@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use plugin_toolkit::mount_recover;
 use plugin_toolkit::orca_async;
 use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
@@ -608,6 +609,59 @@ pub async fn recover_stale_mounts(
     Ok(out)
 }
 
+// ── consumer-aware self-heal wiring ──────────────────────────────────────────
+//
+// The host-mount sweep above can restore a cifs session while a long-running
+// container that bind-mounted a subpath still pins the dead one — the host probe
+// is structurally blind to that (the host IS healthy). The consumer half —
+// enumerate docker/pct binds, probe the bind ROOT inside each guest, restart the
+// ones stale-while-host-healthy, start stopped guests whose bind is now live — is
+// fstype-agnostic and lives in `plugin_toolkit::mount_recover`, shared with the
+// nfs backend rather than duplicated. smb supplies only the `host_healthy`
+// closure, computed from its own cifs mount table, so the shared guard never
+// restarts a fleet of consumers during a host-wide outage.
+
+/// A watched cifs mount plus its last health verdict — the post-recovery snapshot
+/// the consumer guard reads instead of re-probing per consumer.
+struct HostMountHealth {
+    mountpoint: String,
+    healthy: bool,
+}
+
+/// Snapshot every watched cifs mount's health once, after the host sweep, so the
+/// guard closure does not re-probe per consumer. Only a failure to read the
+/// kernel mount table is fatal.
+fn snapshot_host_health(
+    watch: &[String],
+    health_timeout: Duration,
+) -> Result<Vec<HostMountHealth>, SmbError> {
+    let mut out = Vec::new();
+    for m in list_mounts()? {
+        if !mount_recover::path_under_watch(&m.mountpoint, watch) {
+            continue;
+        }
+        let healthy = health(Path::new(&m.mountpoint), health_timeout) == Health::Ok;
+        out.push(HostMountHealth {
+            mountpoint: m.mountpoint,
+            healthy,
+        });
+    }
+    Ok(out)
+}
+
+/// Is the cifs mount covering `source` healthy? Finds the longest mountpoint that
+/// is a prefix of `source` (the mount the bind actually resolves through) and
+/// returns its verdict. An uncovered or unhealthy source is treated as unhealthy
+/// so the consumer guard errs toward NOT restarting during any doubt.
+fn host_source_healthy(source: &str, mounts: &[HostMountHealth]) -> bool {
+    mounts
+        .iter()
+        .filter(|m| mount_recover::path_under_watch(source, std::slice::from_ref(&m.mountpoint)))
+        .max_by_key(|m| m.mountpoint.len())
+        .map(|m| m.healthy)
+        .unwrap_or(false)
+}
+
 // ── storage domain backend ──────────────────────────────────────────────────
 
 /// SMB/CIFS network-share backend for the `storage` domain. Contributes the
@@ -751,9 +805,54 @@ impl StorageBackend for SmbBackend {
         watch: &[String],
         health_timeout: Duration,
     ) -> Result<RecoverOutcome, StorageError> {
-        recover_stale_mounts(watch, health_timeout)
+        // Host-mount sweep first: force-release + retrigger any wedged cifs
+        // session on the watched mounts.
+        let mut outcome = recover_stale_mounts(watch, health_timeout)
             .await
-            .map_err(|e| StorageError::Transport(e.to_string()))
+            .map_err(|e| StorageError::Transport(e.to_string()))?;
+
+        // Then the shared consumer-aware sweep across every container runtime on
+        // the host (Docker and/or Proxmox `pct`): restart guests whose bind ROOT
+        // is stale while the host mount is healthy, and start stopped guests whose
+        // managed bind is now live. Guarded by a per-source host-health closure
+        // computed from a single post-recovery snapshot.
+        let snapshot = snapshot_host_health(watch, health_timeout)
+            .map_err(|e| StorageError::Transport(e.to_string()))?;
+        let host_healthy = |source: &str| host_source_healthy(source, &snapshot);
+        let runtimes = mount_recover::detect_runtimes().await;
+        let consumers =
+            mount_recover::recover_consumers_multi(&runtimes, watch, health_timeout, host_healthy)
+                .await;
+
+        // `RecoverOutcome` is a closed toolkit type with no consumer fields, so
+        // fold consumer results into its vecs with a `consumer:` tag (host-outage
+        // skips and stopped-guest starts kept distinguishable) so callers still
+        // see them.
+        outcome.recovered.extend(
+            consumers
+                .recovered
+                .into_iter()
+                .map(|n| format!("consumer:{n}")),
+        );
+        outcome.still_stale.extend(
+            consumers
+                .still_stale
+                .into_iter()
+                .map(|n| format!("consumer:{n}")),
+        );
+        outcome.still_stale.extend(
+            consumers
+                .skipped_host_stale
+                .into_iter()
+                .map(|n| format!("consumer-skipped-host-stale:{n}")),
+        );
+        outcome.errors.extend(
+            consumers
+                .errors
+                .into_iter()
+                .map(|e| format!("consumer: {e}")),
+        );
+        Ok(outcome)
     }
 }
 

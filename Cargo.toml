@@ -35,7 +35,7 @@ path = "src/main.rs"
 # TEMP: tracks orca `main` (carries the genericized secret-file seam,
 # SECRET_FILE_DIR/secret_file_path — orca#195, merged). Re-pin to the release tag
 # that first carries #195 once it is cut.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.7-rc.1" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.9-rc.15" }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness probes mount health against a `tempfile`
