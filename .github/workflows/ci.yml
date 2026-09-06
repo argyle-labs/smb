@@ -58,11 +58,12 @@ jobs:
       - name: Drop local-dev cargo patch
         run: rm -f .cargo/config.toml
 
-      - name: Authenticate private orca git dependency (Gitea)
-        run: |
-          git config --global \
-            url."https://x-access-token:${{ secrets.ORCA_FETCH_TOKEN }}@gitea.scottkey.me/".insteadOf \
-            "https://github.com/"
+      # orca's plugin-toolkit is pinned to the PUBLIC github.com/argyle-labs/orca
+      # mirror, which the runner can reach directly (the sccache curl above proves
+      # github.com resolves). We deliberately do NOT rewrite github→gitea here: the
+      # internal gitea.scottkey.me host does not DNS-resolve inside the runner
+      # container, so an insteadOf rewrite makes every cargo git fetch fail. Fetch
+      # github directly (CARGO_NET_GIT_FETCH_WITH_CLI=true, set in env).
 
       - name: Format check
         run: cargo fmt --all --check
