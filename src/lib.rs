@@ -19,10 +19,11 @@ use plugin_toolkit::orca_async;
 use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
+use plugin_toolkit::mount_recover::{detect_runtimes, recover_consumers_multi, ConsumerRecoverResult};
 use plugin_toolkit::storage::{
-    is_valid_secret_file_path, mount_table_of, parse_option_string, probe_health, secret_file_path,
+    is_valid_secret_file_path, mount_table_of, parse_option_string, probe_health_rw, secret_file_path,
     Capability, Health, MountEntry, MountOutcome, MountSpec as StorageMountSpec, MountStyle,
-    NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome, SecretFile, SecretRef,
+    NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome, RecoveryAction, SecretFile, SecretRef,
     Share as StorageShare, StorageBackend, StorageError, StorageKind,
 };
 
@@ -100,9 +101,15 @@ pub fn list_mounts() -> Result<Vec<MountEntry>, SmbError> {
 }
 
 /// Time-bounded health probe of a mountpoint, delegating to the shared
-/// primitive so nfs and smb classify liveness identically.
+/// primitive so nfs and smb classify identically. Uses [`probe_health_rw`]:
+/// liveness first, then — only when live — a marker-file write probe, so a
+/// share whose mode/owner drifted (leaving the mounting identity without write)
+/// reports [`Health::WriteDenied`] instead of a misleading `Ok`. This is the
+/// exact SMB perm-drift class behind the immich upload crash-loop (share mode
+/// drifted 777→775, `orca` lands on "other", every write EACCES while reads
+/// pass). A remount can't fix it — the report drives a server-side chmod/chown.
 pub fn health(mountpoint: &Path, probe_timeout: Duration) -> Health {
-    probe_health(&mountpoint.to_string_lossy(), probe_timeout)
+    probe_health_rw(&mountpoint.to_string_lossy(), probe_timeout)
 }
 
 /// Mount an SMB share. Linux uses `mount.cifs`; macOS uses `mount_smbfs`.
@@ -586,13 +593,19 @@ pub async fn recover_stale_mounts(
             continue;
         }
         let mp = Path::new(&m.mountpoint);
-        match health(mp, health_timeout) {
-            Health::Ok => {}
-            Health::Error => out.errors.push(format!(
-                "probe {}: indeterminate error, left untouched",
+        // Classification is the shared storage decision table, not a hand-rolled
+        // match — the same table nfs and core use, so a new Health variant is
+        // classified once. Leave = mounted+usable (Ok, or WriteDenied where only
+        // server-side perms are wrong; a remount can't fix that). Indeterminate =
+        // never acted on (an ambiguous probe must not force-release a healthy
+        // mount). Recover = force-release + autofs retrigger.
+        match health(mp, health_timeout).recovery_action() {
+            RecoveryAction::Leave => {}
+            RecoveryAction::Indeterminate => out.errors.push(format!(
+                "probe {}: indeterminate health, left untouched",
                 m.mountpoint
             )),
-            Health::Stale | Health::Timeout | Health::Missing => {
+            RecoveryAction::Recover => {
                 let (recovered, errs) = force_and_retrigger(mp, health_timeout).await;
                 out.errors.extend(errs);
                 if recovered {
@@ -608,12 +621,91 @@ pub async fn recover_stale_mounts(
     Ok(out)
 }
 
+/// Is the host mount covering `source` healthy? Finds the longest SMB mountpoint
+/// that is a prefix of `source` (the mount the bind actually resolves through)
+/// and returns whether it probed `Health::Ok`. An uncovered or non-`Ok` source
+/// is treated as unhealthy so the consumer sweep's guard errs toward *not*
+/// restarting during any doubt. Mirrors the nfs plugin's `host_source_healthy`.
+fn smb_host_source_healthy(source: &str, mounts: &[(String, Health)]) -> bool {
+    mounts
+        .iter()
+        .filter(|(mp, _)| match source.strip_prefix(mp.as_str()) {
+            Some("") => true,
+            Some(rest) => rest.starts_with('/'),
+            None => false,
+        })
+        .max_by_key(|(mp, _)| mp.len())
+        .map(|(_, h)| *h == Health::Ok)
+        .unwrap_or(false)
+}
+
+/// Full smb self-heal: run the host-mount sweep ([`recover_stale_mounts`]) first,
+/// then — when a container runtime is present — sweep container consumers whose
+/// bind ROOT went stale after a CIFS flap (host recovered a fresh session, but a
+/// long-running container still pins the dead one and reads ESTALE/`EBADF`). The
+/// consumer half is the shared, fstype-agnostic
+/// [`plugin_toolkit::mount_recover`] logic (also used by nfs); this closes the
+/// smb gap where a remount left stale docker binds behind (the willow-flap →
+/// container ENOENT class). Consumer outcomes fold into the wire
+/// [`RecoverOutcome`] with a `consumer:` prefix so they stay distinguishable
+/// from host-mount recoveries.
+pub async fn recover_stale_with_consumers(
+    watch: &[String],
+    health_timeout: Duration,
+) -> Result<RecoverOutcome, SmbError> {
+    let mut out = recover_stale_mounts(watch, health_timeout).await?;
+
+    let runtimes = detect_runtimes().await;
+    if runtimes.is_empty() {
+        return Ok(out);
+    }
+
+    // One post-recovery health snapshot shared by every consumer guard, so the
+    // host mount table is not re-probed per consumer. Matches the nfs pattern.
+    let snapshot: Vec<(String, Health)> = list_mounts()?
+        .into_iter()
+        .map(|m| {
+            let h = health(Path::new(&m.mountpoint), health_timeout);
+            (m.mountpoint, h)
+        })
+        .collect();
+    let host_healthy = |source: &str| smb_host_source_healthy(source, &snapshot);
+
+    let consumers: ConsumerRecoverResult =
+        recover_consumers_multi(&runtimes, watch, health_timeout, host_healthy).await;
+    fold_consumers(&mut out, consumers);
+    Ok(out)
+}
+
+/// Fold a [`ConsumerRecoverResult`] into the wire [`RecoverOutcome`]. smb has no
+/// dedicated `consumers` field (unlike nfs's richer `RecoverResult`), so the
+/// container outcomes are namespaced with a `consumer:` prefix and merged into
+/// the existing `Vec<String>` buckets; `skipped_host_stale` (host-wide outage
+/// guard fired) and per-consumer failures surface as `errors`.
+fn fold_consumers(out: &mut RecoverOutcome, c: ConsumerRecoverResult) {
+    for name in c.recovered {
+        out.recovered.push(format!("consumer:{name}"));
+    }
+    for name in c.still_stale {
+        out.still_stale.push(format!("consumer:{name}"));
+    }
+    for name in c.skipped_host_stale {
+        out.errors
+            .push(format!("consumer {name}: skipped, covering host mount still stale"));
+    }
+    out.errors.extend(c.errors);
+    if !out.recovered.is_empty() || !out.still_stale.is_empty() {
+        out.no_stale_found = false;
+    }
+}
+
 // ── storage domain backend ──────────────────────────────────────────────────
 
 /// SMB/CIFS network-share backend for the `storage` domain. Contributes the
 /// host's live SMB/CIFS mounts as shares, exposes unmount, owns its option +
-/// credential grammar (`validate_spec` / `render_options`), and self-heals
-/// dead-session mounts (`recover_stale`).
+/// credential grammar (`validate_spec` / `render_options`), and self-heals both
+/// dead-session mounts and the stale container binds a CIFS flap leaves behind
+/// (`recover_stale` → `recover_stale_with_consumers`).
 ///
 /// Mount is left at the default [`StorageError::Unsupported`]: smb mounts are
 /// realized as kernel mounts through core's autofs applier (see
@@ -751,7 +843,7 @@ impl StorageBackend for SmbBackend {
         watch: &[String],
         health_timeout: Duration,
     ) -> Result<RecoverOutcome, StorageError> {
-        recover_stale_mounts(watch, health_timeout)
+        recover_stale_with_consumers(watch, health_timeout)
             .await
             .map_err(|e| StorageError::Transport(e.to_string()))
     }
@@ -769,6 +861,84 @@ pub fn bootstrap() {
 mod tests {
     use super::*;
     use plugin_toolkit::serde_json;
+
+    #[test]
+    fn host_source_healthy_uses_longest_prefix_and_requires_ok() {
+        let mounts = vec![
+            ("/mnt/data".to_string(), Health::Ok),
+            ("/mnt/data/photos".to_string(), Health::Stale),
+        ];
+        // Resolves through the longest covering mount (/mnt/data/photos → Stale).
+        assert!(!smb_host_source_healthy("/mnt/data/photos/library", &mounts));
+        // A path under only the healthy shorter mount is healthy.
+        assert!(smb_host_source_healthy("/mnt/data/media/comics", &mounts));
+        // Exact mountpoint match counts as covered.
+        assert!(smb_host_source_healthy("/mnt/data", &mounts));
+        // Uncovered source is treated as unhealthy (guard errs toward not acting).
+        assert!(!smb_host_source_healthy("/srv/other", &mounts));
+        // A sibling that shares a name prefix but not a path segment is uncovered.
+        assert!(!smb_host_source_healthy("/mnt/database", &mounts));
+    }
+
+    #[test]
+    fn host_source_healthy_unknown_is_not_healthy() {
+        let mounts = vec![("/mnt/x".to_string(), Health::Unknown)];
+        assert!(!smb_host_source_healthy("/mnt/x/sub", &mounts));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_reports_write_denied_for_readonly_dir() {
+        // The SMB perm-drift class (immich crash-loop shape): a live, readable
+        // mount the process can't write to. `health` stats it clean, then the
+        // write probe fails EACCES → `WriteDenied`, not a misleading `Ok`.
+        // Skipped under root, which bypasses mode bits.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let got = health(dir.path(), Duration::from_secs(5));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).ok();
+        if got == Health::Ok {
+            return; // running as root: mode bits bypassed, inconclusive
+        }
+        assert_eq!(got, Health::WriteDenied);
+    }
+
+    #[test]
+    fn fold_consumers_namespaces_and_marks_not_noop() {
+        let mut out = RecoverOutcome {
+            no_stale_found: true,
+            ..Default::default()
+        };
+        let c = ConsumerRecoverResult {
+            healthy: vec!["idle-ctr".into()],
+            recovered: vec!["sabnzbd".into(), "started:komga".into()],
+            skipped_host_stale: vec!["radarr".into()],
+            still_stale: vec!["sonarr".into()],
+            errors: vec!["probe plex: boom".into()],
+            no_consumers_found: false,
+        };
+        fold_consumers(&mut out, c);
+        assert_eq!(out.recovered, vec!["consumer:sabnzbd", "consumer:started:komga"]);
+        assert_eq!(out.still_stale, vec!["consumer:sonarr"]);
+        // skipped_host_stale + carried consumer errors both land in `errors`.
+        assert_eq!(out.errors.len(), 2);
+        assert!(out.errors.iter().any(|e| e.contains("radarr") && e.contains("host mount still stale")));
+        assert!(out.errors.iter().any(|e| e.contains("probe plex: boom")));
+        // Recovering a consumer means the run was not a no-op.
+        assert!(!out.no_stale_found);
+    }
+
+    #[test]
+    fn fold_consumers_empty_leaves_noop_flag() {
+        let mut out = RecoverOutcome {
+            no_stale_found: true,
+            ..Default::default()
+        };
+        fold_consumers(&mut out, ConsumerRecoverResult { no_consumers_found: true, ..Default::default() });
+        assert!(out.no_stale_found);
+        assert!(out.recovered.is_empty() && out.still_stale.is_empty() && out.errors.is_empty());
+    }
 
     #[test]
     fn parse_smbclient_shares_extracts_disk_and_ipc() {

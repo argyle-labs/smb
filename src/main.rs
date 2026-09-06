@@ -1,10 +1,13 @@
 //! Dynamic (subprocess) entrypoint for the smb plugin.
 //!
-//! The toolkit's `serve_storage_plugin!` emits `fn main`, serving this plugin over the orca
-//! socket. The plugin is a `[[bin]]`, owns no runtime, and reaches orca only
-//! through the socket.
-plugin_toolkit::serve_storage_plugin! {
-    name: "smb",
-    target_compat: "any",
-    backend: smb::SmbBackend::new("smb"),
+//! Serves this plugin over the orca socket via the typed `Plugin` builder. The plugin is a
+//! `[[bin]]`, owns no runtime, and reaches orca only through the socket.
+plugin_toolkit::instrument::bootstrap!();
+use plugin_toolkit::plugin::Plugin;
+
+fn main() -> plugin_toolkit::anyhow::Result<()> {
+    Plugin::named("smb")
+        .version(env!("CARGO_PKG_VERSION"))
+        .storage(smb::SmbBackend::new("smb"))
+        .serve()
 }
