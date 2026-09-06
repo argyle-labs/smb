@@ -21,10 +21,10 @@ use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
-    is_valid_secret_file_path, mount_table_of, parse_option_string, probe_health, secret_file_path,
-    Capability, Health, MountEntry, MountOutcome, MountSpec as StorageMountSpec, MountStyle,
-    NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome, SecretFile, SecretRef,
-    Share as StorageShare, StorageBackend, StorageError, StorageKind,
+    is_valid_secret_file_path, mount_table_of, parse_option_string, probe_health_rw,
+    secret_file_path, Capability, Health, MountEntry, MountOutcome, MountSpec as StorageMountSpec,
+    MountStyle, NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome, RecoveryAction,
+    SecretFile, SecretRef, Share as StorageShare, StorageBackend, StorageError, StorageKind,
 };
 
 /// Filesystem types that denote an SMB/CIFS mount in the kernel mount table.
@@ -101,9 +101,15 @@ pub fn list_mounts() -> Result<Vec<MountEntry>, SmbError> {
 }
 
 /// Time-bounded health probe of a mountpoint, delegating to the shared
-/// primitive so nfs and smb classify liveness identically.
+/// primitive so nfs and smb classify identically. Uses [`probe_health_rw`]:
+/// liveness first, then — only when live — a marker-file write probe, so a
+/// share whose mode/owner drifted (leaving the mounting identity without write)
+/// reports [`Health::WriteDenied`] instead of a misleading `Ok`. This is the
+/// exact SMB perm-drift class behind the immich upload crash-loop (share mode
+/// drifted 777→775, `orca` lands on "other", every write EACCES while reads
+/// pass). A remount can't fix it — the report drives a server-side chmod/chown.
 pub fn health(mountpoint: &Path, probe_timeout: Duration) -> Health {
-    probe_health(&mountpoint.to_string_lossy(), probe_timeout)
+    probe_health_rw(&mountpoint.to_string_lossy(), probe_timeout)
 }
 
 /// Mount an SMB share. Linux uses `mount.cifs`; macOS uses `mount_smbfs`.
@@ -587,13 +593,19 @@ pub async fn recover_stale_mounts(
             continue;
         }
         let mp = Path::new(&m.mountpoint);
-        match health(mp, health_timeout) {
-            Health::Ok => {}
-            Health::Error => out.errors.push(format!(
-                "probe {}: indeterminate error, left untouched",
+        // Classification is the shared storage decision table, not a hand-rolled
+        // match — the same table nfs and core use, so a new Health variant is
+        // classified once. Leave = mounted+usable (Ok, or WriteDenied where only
+        // server-side perms are wrong; a remount can't fix that). Indeterminate =
+        // never acted on (an ambiguous probe must not force-release a healthy
+        // mount). Recover = force-release + autofs retrigger.
+        match health(mp, health_timeout).recovery_action() {
+            RecoveryAction::Leave => {}
+            RecoveryAction::Indeterminate => out.errors.push(format!(
+                "probe {}: indeterminate health, left untouched",
                 m.mountpoint
             )),
-            Health::Stale | Health::Timeout | Health::Missing => {
+            RecoveryAction::Recover => {
                 let (recovered, errs) = force_and_retrigger(mp, health_timeout).await;
                 out.errors.extend(errs);
                 if recovered {
@@ -920,6 +932,24 @@ something invalid
         let dir = tempfile::tempdir().unwrap();
         let h = health(dir.path(), Duration::from_secs(2));
         assert_eq!(h, Health::Ok);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_write_denied_for_readonly_dir() {
+        // The SMB perm-drift class (immich crash-loop shape): a live, readable
+        // mount the process can't write to. `health` stats it clean, then the
+        // write probe fails EACCES → `WriteDenied`, not a misleading `Ok`.
+        // Skipped under root, which bypasses mode bits.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let got = health(dir.path(), Duration::from_secs(5));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).ok();
+        if got == Health::Ok {
+            return; // running as root: mode bits bypassed, inconclusive
+        }
+        assert_eq!(got, Health::WriteDenied);
     }
 
     #[cfg(target_os = "macos")]
