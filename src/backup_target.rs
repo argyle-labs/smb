@@ -25,10 +25,11 @@
 //! * a stage slot not in the baseline is new here → push it; one whose path
 //!   already exists remotely is adopted only if its manifest (bar `path` and
 //!   `system`) and every payload size match, else reported as a conflict. A
-//!   local manifest missing only keys this build does not know (stripped by an
-//!   earlier pull) takes them from the remote copy;
-//! * a remote slot absent here is pulled. Slots already held locally are never
-//!   re-copied, so a tampered remote cannot rewrite a local backup.
+//!   PULLED local manifest missing only keys this build does not know (an
+//!   earlier pull stripped them) takes them from the remote copy; a slot
+//!   written here never takes keys from the remote;
+//! * a remote slot absent here is pulled. Payloads already held locally are
+//!   never re-copied, so a tampered remote cannot rewrite a local backup.
 //!
 //! Nothing outside the baseline is ever deleted, deletions per pass are capped,
 //! and nested slots, invalid manifests and same-id conflicts are left untouched
@@ -663,9 +664,9 @@ fn local_payload_sizes(slot_dir: &Path) -> Result<BTreeMap<String, u64>, String>
 enum SlotMatch {
     Different,
     Same,
-    /// The same backup, but the local manifest lacks keys unknown to this build
-    /// that the remote has: an earlier pull stripped them. Carries the remote
-    /// manifest rewritten for this host.
+    /// The same backup, but the pulled local manifest lacks keys unknown to
+    /// this build that the remote has: an earlier pull stripped them. Carries
+    /// the remote manifest rewritten for this host.
     Backfill(String),
 }
 
@@ -677,28 +678,25 @@ fn same_slot(stage: &Path, slot: &str, remote: &dyn SlotRemote) -> SlotMatch {
     let Ok(theirs_json) = remote.manifest(slot) else {
         return SlotMatch::Different;
     };
-    let identity = |m: &str| {
-        validate_manifest(m, slot)?;
-        manifest_identity(m)
-    };
+    let identity = |m: &str| Ok((validate_manifest(m, slot)?.path, manifest_identity(m)?));
     let local = read_local_manifest(stage, slot).and_then(|m| identity(&m));
-    let (Ok(local), Ok(theirs)) = (local, identity(&theirs_json)) else {
+    let (Ok((local_path, local)), Ok((_, theirs))) = (local, identity(&theirs_json)) else {
         return SlotMatch::Different;
     };
-    let verdict = if local == theirs {
-        SlotMatch::Same
-    } else if local.iter().all(|(k, v)| theirs.get(k) == Some(v))
-        && theirs
-            .keys()
-            .all(|k| local.contains_key(k) || !KNOWN_FIELDS.contains(&k.as_str()))
+    let payload = stage.join(slot).join(PAYLOAD);
+    // A slot written here records its own payload path; a pulled one records
+    // the relative `payload` or another stage's path.
+    let pulled = local_path == PAYLOAD || Path::new(&local_path) != payload;
+    let backfill = local != theirs;
+    if backfill
+        && !(pulled
+            && local.iter().all(|(k, v)| theirs.get(k) == Some(v))
+            && theirs
+                .keys()
+                .all(|k| local.contains_key(k) || !KNOWN_FIELDS.contains(&k.as_str())))
     {
-        match rewrite_manifest(&theirs_json, slot, &stage.join(slot).join(PAYLOAD)) {
-            Ok(json) => SlotMatch::Backfill(json),
-            Err(_) => return SlotMatch::Different,
-        }
-    } else {
         return SlotMatch::Different;
-    };
+    }
     let (Ok(ours), Ok(remote_sizes)) = (local_payload_sizes(&stage.join(slot)), remote.sizes(slot))
     else {
         return SlotMatch::Different;
@@ -707,10 +705,15 @@ fn same_slot(stage: &Path, slot: &str, remote: &dyn SlotRemote) -> SlotMatch {
         .into_iter()
         .filter(|(k, _)| k.starts_with("payload/"))
         .collect();
-    if ours == remote_payload {
-        verdict
-    } else {
-        SlotMatch::Different
+    if ours != remote_payload {
+        return SlotMatch::Different;
+    }
+    if !backfill {
+        return SlotMatch::Same;
+    }
+    match rewrite_manifest(&theirs_json, slot, &payload) {
+        Ok(json) => SlotMatch::Backfill(json),
+        Err(_) => SlotMatch::Different,
     }
 }
 
@@ -1509,6 +1512,21 @@ mod tests {
                 false,
             ),
             (
+                "writer duplicate host",
+                with_raw(r#""writer":{"host":"a","host":"b"}"#),
+                false,
+            ),
+            (
+                "writer extra key",
+                writer(serde_json::json!({"host": "a", "x": 1})),
+                true,
+            ),
+            (
+                "nested duplicate in unknown key",
+                with_raw(r#""zz":{"a":1,"a":2}"#),
+                true,
+            ),
+            (
                 "writer machineId null",
                 writer(serde_json::json!({"host": "a", "machineId": null})),
                 false,
@@ -1521,6 +1539,15 @@ mod tests {
                 "{name}: {json}"
             );
         }
+
+        // Duplicates are only checked at the top level and inside `writer`; a
+        // repeated key nested in an unknown field collapses to its last value.
+        let nested = with_raw(r#""zz":{"a":1,"a":2}"#);
+        let out: Value = serde_json::from_str(
+            &rewrite_manifest(&nested, "g/1", Path::new("/stage/g/1/payload")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["zz"], serde_json::json!({"a": 2}));
 
         let pathy = with_raw(r#""Path":"/etc""#);
         let out: Value = serde_json::from_str(
@@ -1888,8 +1915,11 @@ mod tests {
         fs::write(f.a.join("g/1").join(MANIFEST), &full).unwrap();
         f.sync(&f.a).unwrap();
 
-        // B holds the copy an rc.11 pull left: `writer` and unknown keys gone.
+        // B holds the copy an earlier pull left: `writer` and unknown keys gone,
+        // `path` relative.
         write_slot(&f.b, "g/1", "x");
+        let stripped = manifest("g/1", 1, "x", PAYLOAD);
+        fs::write(f.b.join("g/1").join(MANIFEST), stripped).unwrap();
         f.sync(&f.b).unwrap();
         let got: Value =
             serde_json::from_str(&fs::read_to_string(f.b.join("g/1").join(MANIFEST)).unwrap())
@@ -1912,7 +1942,71 @@ mod tests {
         );
         fs::write(f.remote.root.join("g/2").join(MANIFEST), with_note).unwrap();
         write_slot(&f.b, "g/2", "y");
+        fs::write(
+            f.b.join("g/2").join(MANIFEST),
+            manifest("g/2", 1, "y", PAYLOAD),
+        )
+        .unwrap();
         assert!(f.sync(&f.b).unwrap_err().ends_with("not overwritten: g/2"));
+    }
+
+    /// The remote `g/1` carries `writer` and an unknown key over a plain local
+    /// manifest whose `path` is `local_path`.
+    fn superset_case(
+        local_path: impl Fn(&Path) -> String,
+        remote_body: &str,
+    ) -> (Fleet, Result<Outcome, String>) {
+        let f = fleet();
+        write_slot(&f.remote.root, "g/1", remote_body);
+        fs::write(
+            f.remote.root.join("g/1").join(MANIFEST),
+            foreign_manifest("g/1", "bragi", "bragi"),
+        )
+        .unwrap();
+        write_slot(&f.b, "g/1", "x");
+        let path = local_path(&f.b);
+        fs::write(
+            f.b.join("g/1").join(MANIFEST),
+            manifest("g/1", 1, "x", &path),
+        )
+        .unwrap();
+        let out = f.sync(&f.b);
+        (f, out)
+    }
+
+    fn local_manifest(stage: &Path, slot: &str) -> Value {
+        serde_json::from_str(&fs::read_to_string(stage.join(slot).join(MANIFEST)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_slot_pulled_from_another_stage_is_backfilled() {
+        let (f, out) = superset_case(|_| "/other/stage/g/1/payload".into(), "x");
+        out.unwrap();
+        assert_eq!(local_manifest(&f.b, "g/1")["writer"]["host"], "bragi");
+    }
+
+    #[test]
+    fn a_slot_written_here_never_takes_keys_from_the_remote() {
+        let (f, out) = superset_case(|b| b.join("g/1/payload").to_string_lossy().into(), "x");
+        assert!(out.unwrap_err().ends_with("not overwritten: g/1"));
+        assert!(local_manifest(&f.b, "g/1").get("writer").is_none());
+    }
+
+    #[test]
+    fn backfill_with_different_payload_sizes_is_a_conflict() {
+        let (f, out) = superset_case(|_| PAYLOAD.into(), "xx");
+        assert!(out.unwrap_err().ends_with("not overwritten: g/1"));
+        assert!(local_manifest(&f.b, "g/1").get("writer").is_none());
+        assert_eq!(body(&f.b, "g/1"), "x");
+    }
+
+    #[test]
+    fn backfill_never_touches_local_payload_bytes() {
+        let (f, out) = superset_case(|_| PAYLOAD.into(), "y");
+        out.unwrap();
+        assert_eq!(local_manifest(&f.b, "g/1")["writer"]["host"], "bragi");
+        assert_eq!(body(&f.b, "g/1"), "x");
+        assert_eq!(body(&f.remote.root, "g/1"), "y");
     }
 
     #[test]
