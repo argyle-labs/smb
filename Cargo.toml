@@ -20,8 +20,8 @@ name = "smb"
 path = "src/main.rs"
 
 # smb is a BACKEND-ONLY orca plugin: it carries zero `#[orca_tool]`s and instead
-# registers a `storage` StorageBackend, served as a subprocess `[[bin]]` over the
-# orca socket (`plugin_toolkit::serve_storage_plugin!`). Per
+# registers a `storage` StorageBackend and an `smb` `backup_target`, served as a
+# subprocess `[[bin]]` over the orca socket. Per
 # [[feedback-plugin-toolkit-only-no-exceptions]] it reaches the whole orca
 # system — infra AND the `storage` domain (`plugin_toolkit::storage`) — through
 # `plugin-toolkit` alone; it has no other non-orca dependency.
