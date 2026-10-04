@@ -23,16 +23,17 @@
 //! * a slot in the baseline but gone from the remote was pruned elsewhere →
 //!   drop it from the stage;
 //! * a stage slot not in the baseline is new here → push it; one whose path
-//!   already exists remotely is adopted only if its manifest (bar the host-local
-//!   `path`) and every payload size match, else reported as a conflict;
+//!   already exists remotely is adopted only if its manifest (bar `path` and
+//!   `system`) and every payload size match, else reported as a conflict;
 //! * a remote slot absent here is pulled. Slots already held locally are never
 //!   re-copied, so a tampered remote cannot rewrite a local backup.
 //!
 //! Nothing outside the baseline is ever deleted, deletions per pass are capped,
 //! and nested slots, invalid manifests and same-id conflicts are left untouched
-//! and reported. Every pulled manifest is validated and its `path` rewritten to
-//! this host's copy before it becomes visible, since core trusts `path` for
-//! prune and restore. `bisync` was not used: it reconciles files, not slots, so
+//! and reported. Every pulled manifest is validated and its `path` reset to the
+//! slot-relative `payload` before it becomes visible; every other field,
+//! including ones this build does not know (e.g. `writer`), is kept as written.
+//! `bisync` was not used: it reconciles files, not slots, so
 //! it would push a half-written slot, cannot tell a same-id collision from an
 //! update, and needs a `--resync` bootstrap plus its own lock/state recovery.
 
@@ -211,15 +212,15 @@ fn is_replica(r: &DbRow) -> bool {
     }
 }
 
-/// Pick the `backup` row out of every `config_rows` row with this name, with
-/// core's precedence: an owned row over a replica, then newest, then lowest id.
+/// Pick this host's own `backup` row out of every `config_rows` row with this
+/// name: newest, then lowest id. Replicas are another host's settings (stage
+/// path, password secret) and never apply here, as with core's `get_local`.
 pub fn pick_config_json(rows: &[DbRow]) -> Option<String> {
     rows.iter()
-        .filter(|r| text(r, "noun") == "backup")
+        .filter(|r| text(r, "noun") == "backup" && !is_replica(r))
         .min_by(|a, b| {
-            is_replica(a)
-                .cmp(&is_replica(b))
-                .then_with(|| text(b, "updated_at").cmp(&text(a, "updated_at")))
+            text(b, "updated_at")
+                .cmp(&text(a, "updated_at"))
                 .then_with(|| text(a, "id").cmp(&text(b, "id")))
         })
         .map(|r| text(r, "json"))
@@ -240,7 +241,7 @@ fn load_config(name: &str) -> Result<SmbTargetConfig, String> {
         key: row.clone(),
     })?;
     let json = pick_config_json(&rows)
-        .ok_or_else(|| format!("no backup/{row} config row for smb target `{name}`"))?;
+        .ok_or_else(|| format!("no smb target `{name}` configured on this host (backup/{row})"))?;
     SmbTargetConfig::parse(&json)
 }
 
@@ -250,9 +251,13 @@ fn other_stages(name: &str, state_dir: &Path) -> Result<Vec<PathBuf>, String> {
         namespace: String::new(),
         table: "config_rows".into(),
     })?;
+    Ok(other_stage_dirs(&rows, name, state_dir))
+}
+
+/// Stage dirs of the owned smb target rows other than `name`.
+pub(crate) fn other_stage_dirs(rows: &[DbRow], name: &str, state_dir: &Path) -> Vec<PathBuf> {
     let prefix = row_name("");
-    Ok(rows
-        .iter()
+    rows.iter()
         .filter(|r| text(r, "noun") == "backup" && !is_replica(r))
         .filter_map(|r| {
             let other = text(r, "name").strip_prefix(&prefix)?.to_string();
@@ -262,7 +267,7 @@ fn other_stages(name: &str, state_dir: &Path) -> Result<Vec<PathBuf>, String> {
                 .stage_dir(&other, state_dir)
                 .ok()
         })
-        .collect())
+        .collect()
 }
 
 fn state_dir() -> Result<PathBuf, String> {
@@ -502,14 +507,29 @@ pub(crate) fn validate_manifest(json: &str, slot: &str) -> Result<BackupRecord, 
     Ok(rec)
 }
 
-/// A pulled manifest, validated, with `path` pointing at this host's payload
-/// copy: core prunes and restores by `path`, so a foreign or crafted value must
-/// never survive the pull.
-pub(crate) fn rewrite_manifest(json: &str, slot: &str, payload: &Path) -> Result<String, String> {
-    let mut rec = validate_manifest(json, slot)?;
-    rec.path = payload.to_string_lossy().into_owned();
-    rec.system = String::new();
-    serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())
+/// A manifest as a JSON object without the fields that describe where a copy
+/// sits (`path`, `system`) rather than what the backup is. Kept as a `Value` so
+/// fields this build's `BackupRecord` lacks are neither dropped nor ignored.
+fn manifest_identity(json: &str) -> Result<serde_json::Map<String, Value>, String> {
+    let Value::Object(mut obj) =
+        serde_json::from_str(json).map_err(|e| format!("unparsable manifest: {e}"))?
+    else {
+        return Err("manifest is not a JSON object".into());
+    };
+    obj.remove("path");
+    obj.remove("system");
+    Ok(obj)
+}
+
+/// A pulled manifest, validated, with `path` reset to the slot-relative
+/// `payload` and `system` dropped; every other field is kept as written. Core
+/// derives the payload location from where the manifest sits, so a foreign or
+/// crafted `path` must never survive the pull.
+pub(crate) fn rewrite_manifest(json: &str, slot: &str) -> Result<String, String> {
+    validate_manifest(json, slot)?;
+    let mut obj = manifest_identity(json)?;
+    obj.insert("path".into(), Value::String(PAYLOAD.into()));
+    serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())
 }
 
 fn read_local_manifest(stage: &Path, slot: &str) -> Result<String, String> {
@@ -554,21 +574,19 @@ fn local_payload_sizes(slot_dir: &Path) -> Result<BTreeMap<String, u64>, String>
 }
 
 /// Whether a remote slot is the very backup this stage holds under the same
-/// path. SMB exposes no hashes, so this compares the manifest (identity,
-/// timestamp, size, file count, checksum — everything but the host-local
-/// `path`) and every payload file's size. Any doubt reads as "different".
+/// path. SMB exposes no hashes, so this compares every manifest field but
+/// `path` and `system` (unknown ones such as `writer` included) and every
+/// payload file's size. Any doubt reads as "different".
 fn same_slot(stage: &Path, slot: &str, remote: &dyn SlotRemote) -> bool {
-    let local = read_local_manifest(stage, slot).and_then(|m| validate_manifest(&m, slot));
-    let theirs = remote
-        .manifest(slot)
-        .and_then(|m| validate_manifest(&m, slot));
-    let (Ok(mut local), Ok(mut theirs)) = (local, theirs) else {
+    let identity = |m: String| {
+        validate_manifest(&m, slot)?;
+        manifest_identity(&m)
+    };
+    let local = read_local_manifest(stage, slot).and_then(identity);
+    let theirs = remote.manifest(slot).and_then(identity);
+    let (Ok(local), Ok(theirs)) = (local, theirs) else {
         return false;
     };
-    local.path.clear();
-    theirs.path.clear();
-    local.system.clear();
-    theirs.system.clear();
     if local != theirs {
         return false;
     }
@@ -746,10 +764,9 @@ fn pull_into(
     let mut rejected = Vec::new();
     let mut valid = BTreeMap::new();
     for slot in slots {
-        let payload = stage.join(slot).join(PAYLOAD);
         match remote
             .manifest(slot)
-            .and_then(|m| rewrite_manifest(&m, slot, &payload))
+            .and_then(|m| rewrite_manifest(&m, slot))
         {
             Ok(json) => {
                 valid.insert(slot.clone(), json);
@@ -1152,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_config_prefers_owned_then_newest_backup_row() {
+    fn pick_config_takes_the_newest_owned_backup_row() {
         let rows = vec![
             row("1", "backup", 1, "2026-10-04T00:00:00Z", "replica-newer"),
             row("2", "backup", 0, "2026-10-01T00:00:00Z", "owned-older"),
@@ -1160,11 +1177,41 @@ mod tests {
             row("4", "other", 0, "2026-10-09T00:00:00Z", "wrong-noun"),
         ];
         assert_eq!(pick_config_json(&rows).as_deref(), Some("owned-newer"));
-        assert_eq!(
-            pick_config_json(&rows[..1]).as_deref(),
-            Some("replica-newer")
-        );
         assert_eq!(pick_config_json(&rows[3..]), None);
+    }
+
+    // M7
+    #[test]
+    fn pick_config_never_falls_back_to_a_replica() {
+        let rows = vec![
+            row("1", "backup", 1, "2026-10-04T00:00:00Z", "bragi-stage"),
+            row("2", "other", 0, "2026-10-04T00:00:00Z", "wrong-noun"),
+        ];
+        assert_eq!(pick_config_json(&rows), None);
+    }
+
+    // M7
+    #[test]
+    fn other_stage_dirs_lists_only_owned_smb_targets_but_self() {
+        let cfg =
+            |stage: &str| format!(r#"{{"host":"h","share":"s","user":"u","stage":"{stage}"}}"#);
+        let named = |name: &str, replica: i64, stage: &str| {
+            let mut r = row(name, "backup", replica, "t", &cfg(stage));
+            r.insert("name".into(), DbValue::Text(row_name(name)));
+            r
+        };
+        let mut local = named("ignored", 0, "/x/local");
+        local.insert("name".into(), DbValue::Text("target:local:x".into()));
+        let rows = vec![
+            named("self", 0, "/x/self"),
+            named("mine", 0, "/x/mine"),
+            named("theirs", 1, "/x/theirs"),
+            local,
+        ];
+        assert_eq!(
+            other_stage_dirs(&rows, "self", Path::new("/s")),
+            vec![PathBuf::from("/x/mine")]
+        );
     }
 
     // ── dispatch ──
@@ -1253,11 +1300,37 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_manifest_pins_path_to_this_hosts_copy() {
+    fn rewrite_manifest_resets_path_to_the_relative_payload() {
         let m = manifest("g/1", 1, "x", "/etc");
-        let out = rewrite_manifest(&m, "g/1", Path::new("/stage/g/1/payload")).unwrap();
+        let out = rewrite_manifest(&m, "g/1").unwrap();
         let rec: BackupRecord = serde_json::from_str(&out).unwrap();
-        assert_eq!(rec.path, "/stage/g/1/payload");
+        assert_eq!(rec.path, PAYLOAD);
+    }
+
+    /// A manifest from a newer core: `writer`, an unknown future field, and a
+    /// foreign `system`.
+    fn foreign_manifest(slot: &str, writer: &str, system: &str) -> String {
+        let mut v: Value = serde_json::from_str(&manifest(slot, 1, "x", "/etc")).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.insert(
+            "writer".into(),
+            serde_json::json!({"host": writer, "machineId": format!("{writer}-id")}),
+        );
+        obj.insert("futureField".into(), serde_json::json!({"nested": [1, 2]}));
+        obj.insert("system".into(), Value::String(system.into()));
+        serde_json::to_string_pretty(&v).unwrap()
+    }
+
+    // H3
+    #[test]
+    fn rewrite_manifest_keeps_fields_it_does_not_know() {
+        let m = foreign_manifest("g/1", "bragi", "bragi");
+        let out: Value = serde_json::from_str(&rewrite_manifest(&m, "g/1").unwrap()).unwrap();
+        let mut want: Value = serde_json::from_str(&m).unwrap();
+        let obj = want.as_object_mut().unwrap();
+        obj.insert("path".into(), Value::String(PAYLOAD.into()));
+        obj.remove("system");
+        assert_eq!(out, want);
     }
 
     #[test]
@@ -1380,8 +1453,11 @@ mod tests {
         let dir = root.join(slot);
         fs::create_dir_all(dir.join(PAYLOAD)).unwrap();
         fs::write(dir.join(PAYLOAD).join("save.dat"), body).unwrap();
-        let path = dir.join(PAYLOAD).to_string_lossy().into_owned();
-        fs::write(dir.join(MANIFEST), manifest(slot, created_ms, body, &path)).unwrap();
+        fs::write(
+            dir.join(MANIFEST),
+            manifest(slot, created_ms, body, PAYLOAD),
+        )
+        .unwrap();
     }
 
     fn write_slot(root: &Path, slot: &str, body: &str) {
@@ -1528,7 +1604,53 @@ mod tests {
         let rec: BackupRecord =
             serde_json::from_str(&fs::read_to_string(f.b.join("g/1").join(MANIFEST)).unwrap())
                 .unwrap();
-        assert_eq!(rec.path, f.b.join("g/1/payload").to_string_lossy());
+        assert_eq!(rec.path, PAYLOAD);
+    }
+
+    // H3
+    #[test]
+    fn pulled_manifest_keeps_writer_and_unknown_fields() {
+        let f = fleet();
+        write_slot(&f.remote.root, "g/1", "x");
+        let m = foreign_manifest("g/1", "bragi", "bragi");
+        fs::write(f.remote.root.join("g/1").join(MANIFEST), &m).unwrap();
+        f.sync(&f.b).unwrap();
+        let got: Value =
+            serde_json::from_str(&fs::read_to_string(f.b.join("g/1").join(MANIFEST)).unwrap())
+                .unwrap();
+        let sent: Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(got["writer"], sent["writer"]);
+        assert_eq!(got["futureField"], sent["futureField"]);
+        assert_eq!(got["path"], PAYLOAD);
+        assert!(got.get("system").is_none());
+    }
+
+    // H3
+    #[test]
+    fn same_id_from_another_writer_is_a_conflict_even_when_otherwise_identical() {
+        let f = fleet();
+        write_slot(&f.a, "g/1", "x");
+        fs::write(
+            f.a.join("g/1").join(MANIFEST),
+            foreign_manifest("g/1", "bragi", "bragi"),
+        )
+        .unwrap();
+        f.sync(&f.a).unwrap();
+        write_slot(&f.b, "g/1", "x");
+        fs::write(
+            f.b.join("g/1").join(MANIFEST),
+            foreign_manifest("g/1", "hemlock", "bragi"),
+        )
+        .unwrap();
+        let err = f.sync(&f.b).unwrap_err();
+        assert!(err.contains("g/1"), "{err}");
+
+        // The same writer with a different `system`/`path` is the same backup.
+        let c = f.b.with_file_name("c");
+        write_slot(&c, "g/1", "x");
+        let same = foreign_manifest("g/1", "bragi", "willow").replace("/etc", "/elsewhere");
+        fs::write(c.join("g/1").join(MANIFEST), same).unwrap();
+        f.sync(&c).unwrap();
     }
 
     // H1
@@ -1756,7 +1878,7 @@ mod tests {
             &fs::read_to_string(f.b.join("g/[EU] a/1").join(MANIFEST)).unwrap(),
         )
         .unwrap();
-        assert_eq!(rec.path, f.b.join("g/[EU] a/1/payload").to_string_lossy());
+        assert_eq!(rec.path, PAYLOAD);
 
         fs::remove_dir_all(f.b.join("g/[EU] a/1")).unwrap();
         write_slot(&f.b, "g/b/1", "b1");
