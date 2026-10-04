@@ -32,9 +32,8 @@ path = "src/main.rs"
 # owns its own SMB option + credential grammar and hands core only the opaque
 # `OptionSet::Raw` string plus a generic `SecretFile`.
 [dependencies]
-# TEMP: tracks orca `main` (carries the genericized secret-file seam,
-# SECRET_FILE_DIR/secret_file_path — orca#195, merged). Re-pin to the release tag
-# that first carries #195 once it is cut.
+# Tracks orca `main` via the public GitHub git source; the committed Cargo.lock
+# pins the resolved commit and CI builds `--locked`.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 [dev-dependencies]
