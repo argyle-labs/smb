@@ -10,6 +10,13 @@
 //! client crate that handles the kernel-mount and userspace-share-listing
 //! cases together. Shelling out also means the user's existing kerberos
 //! / smb.conf / cifs creds files keep working.
+//!
+//! The plugin also contributes the `smb` backup TARGET ([`backup_target`]),
+//! which reaches a share over rclone instead of a kernel mount so it works for
+//! an unprivileged daemon.
+
+pub mod backup_target;
+pub mod rclone;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
