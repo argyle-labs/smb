@@ -513,7 +513,12 @@ const KNOWN_FIELDS: &[&str] = &[
     "checksum",
     "note",
     "system",
+    "writer",
 ];
+
+/// Known keys a local manifest may lack while still matching the remote: an
+/// absent `writer` means unrecorded, per the contract, so the remote's fills it.
+const BACKFILLABLE: &[&str] = &["writer"];
 
 /// A JSON object that rejects a repeated key, which `Value` would silently
 /// collapse to its last occurrence.
@@ -664,15 +669,17 @@ fn local_payload_sizes(slot_dir: &Path) -> Result<BTreeMap<String, u64>, String>
 enum SlotMatch {
     Different,
     Same,
-    /// The same backup, but the pulled local manifest lacks keys unknown to
-    /// this build that the remote has: an earlier pull stripped them. Carries
+    /// The same backup, but the pulled local manifest lacks keys the remote has
+    /// that this build cannot read, or the backfillable `writer`: an earlier
+    /// pull stripped them. Carries
     /// the remote manifest rewritten for this host.
     Backfill(String),
 }
 
 /// Whether a remote slot is the very backup this stage holds under the same
 /// path. SMB exposes no hashes, so this compares every manifest field but
-/// `path` and `system` (unknown ones such as `writer` included) and every
+/// `path` and `system` (including keys this build cannot read, plus the
+/// backfillable `writer`) and every
 /// payload file's size. Any doubt reads as "different".
 fn same_slot(stage: &Path, slot: &str, remote: &dyn SlotRemote) -> SlotMatch {
     let Ok(theirs_json) = remote.manifest(slot) else {
@@ -691,9 +698,11 @@ fn same_slot(stage: &Path, slot: &str, remote: &dyn SlotRemote) -> SlotMatch {
     if backfill
         && !(pulled
             && local.iter().all(|(k, v)| theirs.get(k) == Some(v))
-            && theirs
-                .keys()
-                .all(|k| local.contains_key(k) || !KNOWN_FIELDS.contains(&k.as_str())))
+            && theirs.keys().all(|k| {
+                local.contains_key(k)
+                    || !KNOWN_FIELDS.contains(&k.as_str())
+                    || BACKFILLABLE.contains(&k.as_str())
+            }))
     {
         return SlotMatch::Different;
     }
@@ -1135,6 +1144,7 @@ pub fn dispatcher(tool: &str, args: Value) -> Option<Result<Value, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plugin_toolkit::contract::backup::BackupWriter;
     use std::cell::Cell;
 
     fn set(items: &[&str]) -> BTreeSet<String> {
@@ -1422,6 +1432,7 @@ mod tests {
             checksum: None,
             note: None,
             system: String::new(),
+            writer: None,
         };
         serde_json::to_string_pretty(&rec).unwrap()
     }
@@ -1571,6 +1582,10 @@ mod tests {
             checksum: Some("c".into()),
             note: Some("n".into()),
             system: "s".into(),
+            writer: Some(BackupWriter {
+                host: "h".into(),
+                machine_id: "m".into(),
+            }),
         };
         let Value::Object(obj) = serde_json::to_value(&rec).unwrap() else {
             panic!("not an object");
@@ -1915,7 +1930,8 @@ mod tests {
         fs::write(f.a.join("g/1").join(MANIFEST), &full).unwrap();
         f.sync(&f.a).unwrap();
 
-        // B holds the copy an earlier pull left: `writer` and unknown keys gone,
+        // B holds the copy an earlier pull left: keys this build cannot read,
+        // plus the backfillable `writer`, gone;
         // `path` relative.
         write_slot(&f.b, "g/1", "x");
         let stripped = manifest("g/1", 1, "x", PAYLOAD);
@@ -1948,6 +1964,40 @@ mod tests {
         )
         .unwrap();
         assert!(f.sync(&f.b).unwrap_err().ends_with("not overwritten: g/2"));
+    }
+
+    #[test]
+    fn writer_conflicts_when_both_set_and_backfills_when_local_lacks_it() {
+        let f = fleet();
+        let (stage, r) = (f.b.as_path(), &f.remote);
+        write_slot(&r.root, "g/1", "x");
+        fs::write(
+            r.root.join("g/1").join(MANIFEST),
+            foreign_manifest("g/1", "bragi", "bragi"),
+        )
+        .unwrap();
+        write_slot(stage, "g/1", "x");
+        fs::write(
+            stage.join("g/1").join(MANIFEST),
+            set_field(
+                &foreign_manifest("g/1", "hemlock", "bragi"),
+                "path",
+                Value::String(PAYLOAD.into()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(same_slot(stage, "g/1", r), SlotMatch::Different);
+
+        let mut local: serde_json::Map<String, Value> =
+            serde_json::from_str(&foreign_manifest("g/1", "bragi", "bragi")).unwrap();
+        local.remove("writer");
+        local.insert("path".into(), Value::String(PAYLOAD.into()));
+        fs::write(
+            stage.join("g/1").join(MANIFEST),
+            serde_json::to_string(&local).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(same_slot(stage, "g/1", r), SlotMatch::Backfill(_)));
     }
 
     /// The remote `g/1` carries `writer` and an unknown key over a plain local
