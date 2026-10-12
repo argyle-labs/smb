@@ -668,6 +668,9 @@ fn snapshot_host_health(
     Ok(out)
 }
 
+/// Owner tag core records on consumers this plugin recovers.
+const RECOVER_OWNER: &str = "smb";
+
 /// Is the cifs mount covering `source` healthy? Finds the longest mountpoint that
 /// is a prefix of `source` (the mount the bind actually resolves through) and
 /// returns its verdict, or `None` when no smb mount covers `source` so the
@@ -675,8 +678,13 @@ fn snapshot_host_health(
 fn host_source_healthy(source: &str, mounts: &[HostMountHealth]) -> Option<bool> {
     mounts
         .iter()
-        .filter(|m| mount_recover::path_under_watch(source, std::slice::from_ref(&m.mountpoint)))
-        .max_by_key(|m| m.mountpoint.len())
+        .filter(|m| {
+            // Trimmed so a trailing slash still component-matches; "/" becomes
+            // "", which prefixes every absolute path.
+            let mp = m.mountpoint.trim_end_matches('/').to_string();
+            mount_recover::path_under_watch(source, &[mp])
+        })
+        .max_by_key(|m| m.mountpoint.trim_end_matches('/').len())
         .map(|m| m.healthy)
 }
 
@@ -839,7 +847,7 @@ impl StorageBackend for SmbBackend {
         let host_healthy = |source: &str| host_source_healthy(source, &snapshot);
         let runtimes = mount_recover::detect_runtimes().await;
         let consumers = mount_recover::recover_consumers_for_owner(
-            "smb",
+            RECOVER_OWNER,
             &runtimes,
             watch,
             health_timeout,
@@ -917,6 +925,21 @@ mod tests {
         assert_eq!(host_source_healthy("/mnt/nfs/data", &mounts), None);
         assert_eq!(host_source_healthy("/mnt/sharex", &mounts), None);
         assert_eq!(host_source_healthy("/mnt/share", &[]), None);
+    }
+
+    #[test]
+    fn host_source_healthy_ignores_trailing_slash_on_mountpoint() {
+        let m = |mp: &str, healthy| HostMountHealth {
+            mountpoint: mp.into(),
+            healthy,
+        };
+        let mounts = vec![m("/mnt/share/", true)];
+        assert_eq!(host_source_healthy("/mnt/share/x", &mounts), Some(true));
+        assert_eq!(host_source_healthy("/mnt/share", &mounts), Some(true));
+        assert_eq!(host_source_healthy("/mnt/sharex", &mounts), None);
+        let mounts = vec![m("/", false), m("/mnt/share/", true)];
+        assert_eq!(host_source_healthy("/srv/a", &mounts), Some(false));
+        assert_eq!(host_source_healthy("/mnt/share/x", &mounts), Some(true));
     }
 
     #[test]
