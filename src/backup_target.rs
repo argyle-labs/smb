@@ -1422,6 +1422,7 @@ mod tests {
             checksum: None,
             note: None,
             system: String::new(),
+            writer: None,
         };
         serde_json::to_string_pretty(&rec).unwrap()
     }
@@ -1571,6 +1572,7 @@ mod tests {
             checksum: Some("c".into()),
             note: Some("n".into()),
             system: "s".into(),
+            writer: None,
         };
         let Value::Object(obj) = serde_json::to_value(&rec).unwrap() else {
             panic!("not an object");

@@ -670,15 +670,14 @@ fn snapshot_host_health(
 
 /// Is the cifs mount covering `source` healthy? Finds the longest mountpoint that
 /// is a prefix of `source` (the mount the bind actually resolves through) and
-/// returns its verdict. An uncovered or unhealthy source is treated as unhealthy
-/// so the consumer guard errs toward NOT restarting during any doubt.
-fn host_source_healthy(source: &str, mounts: &[HostMountHealth]) -> bool {
+/// returns its verdict, or `None` when no smb mount covers `source` so the
+/// toolkit leaves consumers of other backends' mounts alone.
+fn host_source_healthy(source: &str, mounts: &[HostMountHealth]) -> Option<bool> {
     mounts
         .iter()
         .filter(|m| mount_recover::path_under_watch(source, std::slice::from_ref(&m.mountpoint)))
         .max_by_key(|m| m.mountpoint.len())
         .map(|m| m.healthy)
-        .unwrap_or(false)
 }
 
 // ── storage domain backend ──────────────────────────────────────────────────
@@ -839,9 +838,14 @@ impl StorageBackend for SmbBackend {
             .map_err(|e| StorageError::Transport(e.to_string()))?;
         let host_healthy = |source: &str| host_source_healthy(source, &snapshot);
         let runtimes = mount_recover::detect_runtimes().await;
-        let consumers =
-            mount_recover::recover_consumers_multi(&runtimes, watch, health_timeout, host_healthy)
-                .await;
+        let consumers = mount_recover::recover_consumers_for_owner(
+            "smb",
+            &runtimes,
+            watch,
+            health_timeout,
+            host_healthy,
+        )
+        .await;
 
         // `RecoverOutcome` is a closed toolkit type with no consumer fields, so
         // fold consumer results into its vecs with a `consumer:` tag (host-outage
@@ -887,6 +891,33 @@ pub fn bootstrap() {
 mod tests {
     use super::*;
     use plugin_toolkit::serde_json;
+
+    #[test]
+    fn host_source_healthy_is_tri_state() {
+        let mounts = vec![
+            HostMountHealth {
+                mountpoint: "/mnt/share".into(),
+                healthy: false,
+            },
+            HostMountHealth {
+                mountpoint: "/mnt/share/sub".into(),
+                healthy: true,
+            },
+            HostMountHealth {
+                mountpoint: "/mnt/dead".into(),
+                healthy: false,
+            },
+        ];
+        assert_eq!(host_source_healthy("/mnt/share/sub/x", &mounts), Some(true));
+        assert_eq!(
+            host_source_healthy("/mnt/share/other", &mounts),
+            Some(false)
+        );
+        assert_eq!(host_source_healthy("/mnt/dead", &mounts), Some(false));
+        assert_eq!(host_source_healthy("/mnt/nfs/data", &mounts), None);
+        assert_eq!(host_source_healthy("/mnt/sharex", &mounts), None);
+        assert_eq!(host_source_healthy("/mnt/share", &[]), None);
+    }
 
     #[test]
     fn parse_smbclient_shares_extracts_disk_and_ipc() {
