@@ -252,7 +252,13 @@ pub const SMB_VERSIONS: &[&str] = &["1.0", "2.0", "2.1", "3.0", "3.02", "3.1.1"]
 
 pub const SMB_SECURE_VERSION: &str = "3.1.1";
 
-pub const SMB_WEAK_SEC: &[&str] = &["none", "ntlm", "lanman"];
+pub const SMB_WEAK_SEC: &[&str] = &[
+    "none", "ntlm", "ntlmi", "ntlmv2", "ntlmv2i", "lanman", "lanmani",
+];
+
+pub const SMB_WEAK_FLAGS: &[&str] = &["noseal", "nosign"];
+
+pub const SMB_REJECTED_RENDER: &str = "vers=orca-rejected,seal";
 
 /// SMB/CIFS credential source. This backend owns the credential grammar: it
 /// validates that exactly one coherent form is supplied, then renders it into the
@@ -326,13 +332,19 @@ pub struct SmbOptions {
 
 pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, StorageError> {
     let raw = spec.options.as_deref().unwrap_or("");
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(StorageError::Other(
+            "smb: option string must not contain whitespace or control characters".to_string(),
+        ));
+    }
 
     let mut vers: Option<String> = None;
     let mut creds_path: Option<String> = None;
     let mut guest = false;
     let mut allow_guest = false;
     let mut allow_weak_transport = false;
-    let mut sec: Option<String> = None;
+    let mut sec: Vec<String> = Vec::new();
+    let mut weak_flags: Vec<String> = Vec::new();
     let mut username: Option<String> = None;
     let mut domain: Option<String> = None;
     let mut uid: Option<String> = None;
@@ -343,8 +355,9 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
 
     // Generic tokenizer (core mechanics); the SMB grammar below is all ours.
     for opt in parse_option_string(raw) {
-        let (key, value) = (opt.key, opt.value.map(str::to_string));
-        match (key, value) {
+        let key = opt.key.to_ascii_lowercase();
+        let value = opt.value.map(str::to_string);
+        match (key.as_str(), value) {
             ("vers", Some(v)) => {
                 if !SMB_VERSIONS.contains(&v.as_str()) {
                     return Err(StorageError::Other(format!(
@@ -354,13 +367,27 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
                 }
                 vers = Some(v);
             }
-            ("credentials", Some(v)) | ("cred", Some(v)) => creds_path = Some(v),
+            ("credentials", Some(v)) | ("cred", Some(v)) => {
+                let p = Path::new(&v);
+                if !p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err(StorageError::Other(format!(
+                        "smb: `credentials=` must be an absolute path without `..` (got `{v}`)"
+                    )));
+                }
+                creds_path = Some(v)
+            }
             ("guest", None) => guest = true,
             ("allow_guest", None) => allow_guest = true,
             ("allow_weak_transport", None) => allow_weak_transport = true,
             ("sec", Some(v)) => {
-                sec = Some(v.clone());
+                let v = v.to_ascii_lowercase();
                 extra.push(format!("sec={v}"));
+                sec.push(v);
+            }
+            (k, None) if SMB_WEAK_FLAGS.contains(&k) => {
+                weak_flags.push(k.to_string());
+                extra.push(k.to_string());
             }
             // `password`/`pass` must never be declared inline in the store — the
             // password is a secrets-domain `SecretRef`, not a plaintext option.
@@ -378,9 +405,9 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
             ("iocharset", Some(v)) => iocharset = Some(v),
             ("noperm", None) => noperm = true,
             // Unknown-but-legal option: preserve it verbatim, order-stable.
-            _ => extra.push(match opt.value {
-                Some(v) => format!("{}={v}", opt.key),
-                None => opt.key.to_string(),
+            (k, v) => extra.push(match v {
+                Some(v) => format!("{k}={v}"),
+                None => k.to_string(),
             }),
         }
     }
@@ -391,9 +418,14 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
                 "smb: vers `{v}` is below the {SMB_SECURE_VERSION} floor; set `allow_weak_transport` to opt out"
             )));
         }
-        if let Some(s) = sec.as_deref().filter(|s| SMB_WEAK_SEC.contains(s)) {
+        if let Some(s) = sec.iter().find(|s| SMB_WEAK_SEC.contains(&s.as_str())) {
             return Err(StorageError::Other(format!(
                 "smb: `sec={s}` is insecure; set `allow_weak_transport` to opt out"
+            )));
+        }
+        if let Some(f) = weak_flags.first() {
+            return Err(StorageError::Other(format!(
+                "smb: `{f}` weakens the transport; set `allow_weak_transport` to opt out"
             )));
         }
     }
@@ -526,6 +558,23 @@ pub fn render_smb_options(o: &SmbOptions, target: &str) -> String {
 /// or (fail-closed) if the SecretRef cannot be resolved — the mount then
 /// references a creds-file that does not exist and simply fails to authenticate,
 /// which is safer than leaking or guessing.
+pub fn render_checked(spec: &NormalizedSpec) -> Result<String, StorageError> {
+    let OptionSet::Raw { options } = &spec.options;
+    let mount_spec = StorageMountSpec {
+        backend: spec.backend.clone(),
+        target: spec.target.clone(),
+        fstype: spec.fstype.clone(),
+        source: spec.source.clone(),
+        failover_sources: spec.failover_sources.clone(),
+        options: options.clone(),
+        credential: spec.credential.clone(),
+        remount_policy: spec.remount_policy.clone(),
+        enabled: spec.enabled,
+    };
+    let o = validate_smb_options(&mount_spec)?;
+    Ok(render_smb_options(&o, &spec.target))
+}
+
 fn build_secret_file(o: &SmbOptions, target: &str) -> Option<SecretFile> {
     let SmbCredentials::Inline {
         username,
@@ -784,22 +833,7 @@ impl StorageBackend for SmbBackend {
     /// re-parse + re-render so credential safety (the `credentials=<path>`
     /// reference) is always applied.
     fn render_options(&self, spec: &NormalizedSpec) -> String {
-        let OptionSet::Raw { options } = &spec.options;
-        let mount_spec = StorageMountSpec {
-            backend: spec.backend.clone(),
-            target: spec.target.clone(),
-            fstype: spec.fstype.clone(),
-            source: spec.source.clone(),
-            failover_sources: spec.failover_sources.clone(),
-            options: options.clone(),
-            credential: spec.credential.clone(),
-            remount_policy: spec.remount_policy.clone(),
-            enabled: spec.enabled,
-        };
-        match validate_smb_options(&mount_spec) {
-            Ok(o) => render_smb_options(&o, &spec.target),
-            Err(_) => options.clone().unwrap_or_default(),
-        }
+        render_checked(spec).unwrap_or_else(|_| SMB_REJECTED_RENDER.to_string())
     }
 
     fn net_fstypes(&self) -> Vec<String> {
@@ -1357,10 +1391,78 @@ something invalid
             }
         );
         assert!(normalized.secret_file.is_none(), "guest has no secret-file");
+        assert_eq!(backend.render_options(&normalized), SMB_REJECTED_RENDER);
+
+        let spec = smb_spec(Some("credentials=/etc/c,uid=1000"), None);
+        let normalized = backend.validate_spec(&spec).await.expect("validate");
         assert_eq!(
             backend.render_options(&normalized),
-            "guest,uid=1000,vers=3.1.1,seal"
+            "vers=3.1.1,credentials=/etc/c,uid=1000,seal"
         );
+    }
+
+    fn normalized(options: &str) -> NormalizedSpec {
+        NormalizedSpec {
+            backend: "smb".into(),
+            target: "/mnt/media".into(),
+            fstype: "cifs".into(),
+            source: "//nas/media".into(),
+            failover_sources: vec![],
+            options: OptionSet::Raw {
+                options: Some(options.into()),
+            },
+            credential: None,
+            secret_file: None,
+            remount_policy: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn render_options_fails_closed_on_rejected_strings() {
+        let backend = SmbBackend::new("smb");
+        for raw in [
+            "vers=1.0,guest,allow_guest",
+            "guest",
+            "vers=3.1.1,credentials=/etc/c,sec=ntlm",
+            "",
+        ] {
+            let n = normalized(raw);
+            assert!(render_checked(&n).is_err(), "{raw}");
+            assert_eq!(backend.render_options(&n), SMB_REJECTED_RENDER, "{raw}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_smuggled_weak_options() {
+        for raw in [
+            "VERS=1.0,credentials=/etc/c",
+            "Sec=ntlm,credentials=/etc/c",
+            "sec=NTLMv2,credentials=/etc/c",
+            "sec=ntlm,sec=krb5,credentials=/etc/c",
+            "vers=3.1.1,vers=1.0,credentials=/etc/c",
+            "noseal,credentials=/etc/c",
+            "NoSeal,credentials=/etc/c",
+            "GUEST",
+            "credentials=/etc/c,uid=0\nevil",
+            "credentials=/etc/c,uid=0\n/x -fstype=cifs ://h/s",
+            "credentials=etc/c",
+            "credentials=/etc/../root/c",
+        ] {
+            assert!(
+                validate_smb_options(&smb_spec(Some(raw), None)).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_flags_never_render() {
+        let r = render(&smb_spec(
+            Some("vers=3.0,guest,allow_guest,allow_weak_transport"),
+            None,
+        ));
+        assert!(!r.contains("allow_"), "{r}");
     }
 
     #[tokio::test]

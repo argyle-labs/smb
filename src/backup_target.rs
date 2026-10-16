@@ -49,7 +49,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -313,6 +313,14 @@ pub(crate) fn prepare_stage(
         ));
     }
     let marker = stage.join(STAGE_MARKER);
+    match fs::symlink_metadata(stage) {
+        Ok(m) if !m.file_type().is_dir() => {
+            return Err(format!("stage {} is not a real directory", stage.display()))
+        }
+        Ok(_) => fs::set_permissions(stage, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod {}: {e}", stage.display()))?,
+        Err(_) => {}
+    }
     if marker.is_file() {
         return Ok(());
     }
@@ -682,7 +690,11 @@ fn payload_hashes(slot_dir: &Path) -> Result<BTreeMap<String, String>, String> {
     local_payload_sizes(slot_dir)?
         .into_keys()
         .map(|rel| {
-            let hex = sha256_file(&slot_dir.join(&rel)).map_err(|e| format!("hash {rel}: {e}"))?;
+            let path = slot_dir.join(&rel);
+            if !fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+                return Err(format!("{rel} is not a regular file"));
+            }
+            let hex = sha256_file(&path).map_err(|e| format!("hash {rel}: {e}"))?;
             Ok((rel, hex))
         })
         .collect()
@@ -2173,6 +2185,31 @@ mod tests {
         }
         f.sync(&f.b).unwrap();
         assert_eq!(body(&f.b, "g/1"), "x");
+    }
+
+    #[test]
+    fn existing_stage_is_tightened_and_symlinks_rejected() {
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o777)).unwrap();
+        prepare_stage(&stage, &tmp.path().join("state"), &[]).unwrap();
+        assert_eq!(mode(&stage), 0o700);
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(prepare_stage(&link, &tmp.path().join("state"), &[]).is_err());
+    }
+
+    #[test]
+    fn payload_symlink_is_never_hashed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = tmp.path().join("s");
+        fs::create_dir_all(slot.join(PAYLOAD)).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", slot.join(PAYLOAD).join("x")).unwrap();
+        assert!(payload_hashes(&slot).is_err());
     }
 
     #[test]
