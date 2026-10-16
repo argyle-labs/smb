@@ -28,10 +28,11 @@ use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
-    is_valid_secret_file_path, mount_table_of, parse_option_string, probe_health_rw,
-    secret_file_path, Capability, Health, MountEntry, MountOutcome, MountSpec as StorageMountSpec,
-    MountStyle, NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome, RecoveryAction,
-    SecretFile, SecretRef, Share as StorageShare, StorageBackend, StorageError, StorageKind,
+    apply_option_floor, is_valid_secret_file_path, mount_table_of, parse_option_string,
+    probe_health_rw, secret_file_path, Capability, Health, MountEntry, MountOutcome,
+    MountSpec as StorageMountSpec, MountStyle, NormalizedSpec, OptionBuilder, OptionSet,
+    RecoverOutcome, RecoveryAction, SecretFile, SecretRef, Share as StorageShare, StorageBackend,
+    StorageError, StorageKind,
 };
 
 /// Filesystem types that denote an SMB/CIFS mount in the kernel mount table.
@@ -80,12 +81,11 @@ pub enum ShareKind {
     Other,
 }
 
-/// Credentials for [`mount`]. Either a creds-file path (with `username=` and
-/// `password=` lines, as cifs.upcall expects) or inline username+password.
+/// Credentials for [`mount`]: a creds-file path (with `username=` and
+/// `password=` lines, as cifs.upcall expects) or guest.
 #[derive(Debug, Clone)]
 pub enum Credentials {
     File(PathBuf),
-    Inline { username: String, password: String },
     Guest,
 }
 
@@ -129,10 +129,6 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
         let mut opts: Vec<String> = Vec::new();
         match &spec.credentials {
             Credentials::File(p) => opts.push(format!("credentials={}", p.display())),
-            Credentials::Inline { username, password } => {
-                opts.push(format!("username={username}"));
-                opts.push(format!("password={password}"));
-            }
             Credentials::Guest => opts.push("guest".to_string()),
         }
         opts.extend(spec.extra_opts.iter().cloned());
@@ -151,14 +147,7 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
     #[cfg(target_os = "macos")]
     {
         which("mount_smbfs").ok_or(SmbError::MissingTool("mount_smbfs"))?;
-        let auth_part = match &spec.credentials {
-            Credentials::Inline { username, password } => {
-                format!("{}:{}@", urlencode(username), urlencode(password))
-            }
-            Credentials::Guest => String::new(),
-            Credentials::File(_) => String::new(), // macOS uses keychain; ignored.
-        };
-        let url = format!("//{}{}/{}", auth_part, spec.server, spec.share);
+        let url = format!("//{}/{}", spec.server, spec.share);
         run_tool(
             "mount_smbfs",
             &[url.as_str(), spec.mountpoint.to_str().unwrap_or("")],
@@ -184,10 +173,6 @@ pub async fn list_shares(server: &str, credentials: &Credentials) -> Result<Vec<
     let mut args: Vec<String> = vec!["-L".into(), format!("//{server}"), "-g".into()];
     match credentials {
         Credentials::Guest => args.push("-N".into()),
-        Credentials::Inline { username, password } => {
-            args.push("-U".into());
-            args.push(format!("{username}%{password}"));
-        }
         Credentials::File(p) => {
             args.push("-A".into());
             args.push(p.display().to_string());
@@ -249,21 +234,6 @@ async fn run_tool(tool: &'static str, args: &[&str]) -> Result<(), SmbError> {
         })
 }
 
-#[cfg(target_os = "macos")]
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            out.push(c);
-        } else {
-            for byte in c.to_string().as_bytes() {
-                out.push_str(&format!("%{byte:02X}"));
-            }
-        }
-    }
-    out
-}
-
 // ── smb/cifs option grammar (Phase 3) ────────────────────────────────────────
 //
 // This backend owns the grammar of its own mount options. `validate_spec` parses
@@ -276,11 +246,13 @@ fn urlencode(s: &str) -> String {
 // map — the password is a `SecretRef` the secrets domain resolves, and inline
 // credentials are referenced through a root-written `credentials=<path>` file.
 
-/// SMB protocol versions this backend accepts for the `vers=` mount option.
-/// mount.cifs accepts more (1.0, 2.0, 2.1, 3.0, 3.02, 3.1.1); we accept the
-/// modern, safe set and reject anything else at declare time so a typo surfaces
-/// before a mount is ever attempted.
-pub const SMB_VERSIONS: &[&str] = &["2.0", "2.1", "3.0", "3.1.1"];
+/// `vers=` values mount.cifs understands. Without `allow_weak_transport` only
+/// [`SMB_SECURE_VERSION`] is accepted.
+pub const SMB_VERSIONS: &[&str] = &["1.0", "2.0", "2.1", "3.0", "3.02", "3.1.1"];
+
+pub const SMB_SECURE_VERSION: &str = "3.1.1";
+
+pub const SMB_WEAK_SEC: &[&str] = &["none", "ntlm", "lanman"];
 
 /// SMB/CIFS credential source. This backend owns the credential grammar: it
 /// validates that exactly one coherent form is supplied, then renders it into the
@@ -318,9 +290,10 @@ pub fn render_creds_file(username: &str, password: &str, domain: Option<&str>) -
 /// [`SmbCredentials`]-carrying option set.
 ///
 /// Grammar accepted in the raw option string:
-///   * `vers=<v>`         — must be one of [`SMB_VERSIONS`]
+///   * `vers=<v>`         — must be [`SMB_SECURE_VERSION`] unless `allow_weak_transport`
+///   * `sec=<s>`          — [`SMB_WEAK_SEC`] rejected unless `allow_weak_transport`
 ///   * `credentials=<p>`  — a creds-file path (File credential form)
-///   * `guest`            — anonymous mount (Guest credential form)
+///   * `guest`            — anonymous mount; requires `allow_guest`
 ///   * `username=<u>`     — inline username (Inline form; password from `SecretRef`)
 ///   * `domain=<d>`       — inline domain (only valid alongside `username=`)
 ///   * `uid=<u>` / `gid=<g>` / `iocharset=<c>` — mapping options
@@ -332,7 +305,7 @@ pub fn render_creds_file(username: &str, password: &str, domain: Option<&str>) -
 ///   * `guest` present                      → [`SmbCredentials::Guest`]
 ///   * `username=` present + spec credential → [`SmbCredentials::Inline`]
 ///     (the `credential` field carries the password `SecretRef`)
-///   * none of the above                    → default to Guest
+///   * none of the above                    → rejected
 ///
 /// Conflicting forms (e.g. `guest` + `credentials=`, or `username=` without a
 /// password `SecretRef`, or `credentials=` + `username=`) are rejected with a
@@ -342,6 +315,7 @@ pub fn render_creds_file(username: &str, password: &str, domain: Option<&str>) -
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmbOptions {
     pub vers: Option<String>,
+    pub allow_weak_transport: bool,
     pub credentials: SmbCredentials,
     pub uid: Option<String>,
     pub gid: Option<String>,
@@ -356,6 +330,9 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
     let mut vers: Option<String> = None;
     let mut creds_path: Option<String> = None;
     let mut guest = false;
+    let mut allow_guest = false;
+    let mut allow_weak_transport = false;
+    let mut sec: Option<String> = None;
     let mut username: Option<String> = None;
     let mut domain: Option<String> = None;
     let mut uid: Option<String> = None;
@@ -379,6 +356,12 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
             }
             ("credentials", Some(v)) | ("cred", Some(v)) => creds_path = Some(v),
             ("guest", None) => guest = true,
+            ("allow_guest", None) => allow_guest = true,
+            ("allow_weak_transport", None) => allow_weak_transport = true,
+            ("sec", Some(v)) => {
+                sec = Some(v.clone());
+                extra.push(format!("sec={v}"));
+            }
             // `password`/`pass` must never be declared inline in the store — the
             // password is a secrets-domain `SecretRef`, not a plaintext option.
             ("password" | "pass", _) => {
@@ -402,6 +385,24 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
         }
     }
 
+    if !allow_weak_transport {
+        if let Some(v) = vers.as_deref().filter(|v| *v != SMB_SECURE_VERSION) {
+            return Err(StorageError::Other(format!(
+                "smb: vers `{v}` is below the {SMB_SECURE_VERSION} floor; set `allow_weak_transport` to opt out"
+            )));
+        }
+        if let Some(s) = sec.as_deref().filter(|s| SMB_WEAK_SEC.contains(s)) {
+            return Err(StorageError::Other(format!(
+                "smb: `sec={s}` is insecure; set `allow_weak_transport` to opt out"
+            )));
+        }
+    }
+    if guest && !allow_guest {
+        return Err(StorageError::Other(
+            "smb: `guest` requires the explicit `allow_guest` flag".to_string(),
+        ));
+    }
+
     let credentials = resolve_smb_credentials(
         creds_path,
         guest,
@@ -412,6 +413,7 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
 
     Ok(SmbOptions {
         vers,
+        allow_weak_transport,
         credentials,
         uid,
         gid,
@@ -456,10 +458,11 @@ fn resolve_smb_credentials(
                     .to_string(),
             )),
         },
-        // Explicit guest.
         (None, true, None) => Ok(SmbCredentials::Guest),
-        // Nothing declared: default to an anonymous (guest) mount.
-        (None, false, None) => Ok(SmbCredentials::Guest),
+        (None, false, None) => Err(StorageError::Other(
+            "smb: no credentials declared; set `credentials=`, `username=`, or `guest,allow_guest`"
+                .to_string(),
+        )),
     }
 }
 
@@ -503,7 +506,16 @@ pub fn render_smb_options(o: &SmbOptions, target: &str) -> String {
         b.opt("iocharset", Some(v));
     }
     b.flag("noperm", o.noperm).extra(o.extra.clone());
-    b.finish()
+    let base = b.finish();
+    let mut parts: Vec<String> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split(',').map(str::to_string).collect()
+    };
+    if !o.allow_weak_transport {
+        apply_option_floor(&mut parts, &[("vers", "vers=3.1.1"), ("seal", "seal")], &[]);
+    }
+    parts.join(",")
 }
 
 /// Build the generic [`SecretFile`] for an inline-credential mount: resolve the
@@ -1013,14 +1025,6 @@ something invalid
         assert_eq!(got, Health::WriteDenied);
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn urlencode_passes_safe_chars_and_escapes_others() {
-        assert_eq!(urlencode("abcXYZ012-_.~"), "abcXYZ012-_.~");
-        assert_eq!(urlencode("a b"), "a%20b");
-        assert_eq!(urlencode("p@ss/word"), "p%40ss%2Fword");
-    }
-
     #[tokio::test]
     async fn unmount_invalid_path_returns_tool_failed() {
         // umount(1) is universally present on macOS/Linux; the failure path
@@ -1079,7 +1083,7 @@ something invalid
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn mount_macos_with_inline_creds_runs_through_to_tool() {
+    async fn mount_macos_guest_runs_through_to_tool() {
         // mount_smbfs exists on macOS; pointing at a black-hole server
         // forces it to exit non-zero so we exercise the
         // run_tool/ToolFailed branch. If the binary somehow isn't on PATH,
@@ -1089,10 +1093,7 @@ something invalid
             server: "127.0.0.1:1",
             share: "nope",
             mountpoint: dir.path(),
-            credentials: Credentials::Inline {
-                username: "u".into(),
-                password: "p".into(),
-            },
+            credentials: Credentials::Guest,
             extra_opts: vec![],
         };
         let res = mount(spec).await;
@@ -1137,9 +1138,12 @@ something invalid
     }
 
     #[test]
-    fn validate_accepts_each_supported_vers() {
+    fn validate_accepts_each_supported_vers_with_weak_opt_in() {
         for v in SMB_VERSIONS {
-            let spec = smb_spec(Some(&format!("vers={v},guest")), None);
+            let spec = smb_spec(
+                Some(&format!("vers={v},guest,allow_guest,allow_weak_transport")),
+                None,
+            );
             let set = validate_smb_options(&spec).expect("supported vers accepted");
             assert_eq!(set.vers.as_deref(), Some(*v));
         }
@@ -1147,16 +1151,58 @@ something invalid
 
     #[test]
     fn validate_rejects_bad_vers() {
-        let spec = smb_spec(Some("vers=9.9,guest"), None);
+        let spec = smb_spec(Some("vers=9.9,guest,allow_guest"), None);
         let err = validate_smb_options(&spec).expect_err("bad vers rejected");
         assert!(err.to_string().contains("unsupported vers"), "got: {err}");
     }
 
     #[test]
-    fn validate_accepts_guest() {
-        let spec = smb_spec(Some("vers=3.0,guest"), None);
+    fn validate_accepts_guest_only_with_allow_guest() {
+        let spec = smb_spec(Some("guest,allow_guest"), None);
         let set = validate_smb_options(&spec).expect("guest accepted");
         assert!(matches!(set.credentials, SmbCredentials::Guest));
+        let err = validate_smb_options(&smb_spec(Some("guest"), None)).expect_err("gated");
+        assert!(err.to_string().contains("allow_guest"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_weak_transport_without_opt_in() {
+        for opts in [
+            "vers=1.0",
+            "vers=2.0",
+            "vers=2.1",
+            "vers=3.0",
+            "sec=none",
+            "sec=ntlm",
+            "sec=lanman",
+        ] {
+            let spec = smb_spec(Some(&format!("{opts},credentials=/etc/c")), None);
+            let err = validate_smb_options(&spec).expect_err(opts);
+            assert!(
+                err.to_string().contains("allow_weak_transport"),
+                "got: {err}"
+            );
+            let spec = smb_spec(
+                Some(&format!("{opts},credentials=/etc/c,allow_weak_transport")),
+                None,
+            );
+            assert!(validate_smb_options(&spec).is_ok(), "{opts} with opt-in");
+        }
+    }
+
+    #[test]
+    fn render_applies_transport_floor() {
+        assert_eq!(
+            render(&smb_spec(Some("credentials=/etc/c"), None)),
+            "credentials=/etc/c,vers=3.1.1,seal"
+        );
+        assert_eq!(
+            render(&smb_spec(
+                Some("vers=3.0,credentials=/etc/c,allow_weak_transport"),
+                None
+            )),
+            "vers=3.0,credentials=/etc/c"
+        );
     }
 
     #[test]
@@ -1175,7 +1221,7 @@ something invalid
     #[test]
     fn validate_accepts_inline_with_secret_ref() {
         let spec = smb_spec(
-            Some("vers=3.0,username=svc,domain=WORKGROUP"),
+            Some("vers=3.1.1,username=svc,domain=WORKGROUP"),
             Some("onepassword://vault/item"),
         );
         let set = validate_smb_options(&spec).expect("inline creds accepted");
@@ -1194,10 +1240,10 @@ something invalid
     }
 
     #[test]
-    fn validate_defaults_to_guest_when_nothing_declared() {
-        let spec = smb_spec(Some("vers=3.0,uid=1000"), None);
-        let set = validate_smb_options(&spec).expect("defaults to guest");
-        assert!(matches!(set.credentials, SmbCredentials::Guest));
+    fn validate_rejects_missing_credentials() {
+        let spec = smb_spec(Some("vers=3.1.1,uid=1000"), None);
+        let err = validate_smb_options(&spec).expect_err("no guest fallback");
+        assert!(err.to_string().contains("no credentials"), "got: {err}");
     }
 
     #[test]
@@ -1218,7 +1264,7 @@ something invalid
 
     #[test]
     fn validate_rejects_conflicting_guest_and_file() {
-        let spec = smb_spec(Some("guest,credentials=/etc/smb.creds"), None);
+        let spec = smb_spec(Some("guest,allow_guest,credentials=/etc/smb.creds"), None);
         let err = validate_smb_options(&spec).expect_err("guest+file rejected");
         assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
     }
@@ -1235,7 +1281,7 @@ something invalid
 
     #[test]
     fn validate_preserves_unknown_options_in_extra() {
-        let spec = smb_spec(Some("guest,seal,cache=strict"), None);
+        let spec = smb_spec(Some("guest,allow_guest,seal,cache=strict"), None);
         let set = validate_smb_options(&spec).expect("passthrough accepted");
         assert!(set.extra.contains(&"seal".to_string()));
         assert!(set.extra.contains(&"cache=strict".to_string()));
@@ -1244,20 +1290,20 @@ something invalid
     #[test]
     fn render_file_credentials_references_the_path() {
         let rendered = render(&smb_spec(
-            Some("vers=3.0,credentials=/etc/smb.creds,uid=1000,noperm"),
+            Some("vers=3.1.1,credentials=/etc/smb.creds,uid=1000,noperm"),
             None,
         ));
         assert_eq!(
             rendered,
-            "vers=3.0,credentials=/etc/smb.creds,uid=1000,noperm"
+            "vers=3.1.1,credentials=/etc/smb.creds,uid=1000,noperm,seal"
         );
     }
 
     #[test]
     fn render_guest_emits_guest() {
         assert_eq!(
-            render(&smb_spec(Some("vers=3.1.1,guest"), None)),
-            "vers=3.1.1,guest"
+            render(&smb_spec(Some("vers=3.1.1,guest,allow_guest"), None)),
+            "vers=3.1.1,guest,seal"
         );
     }
 
@@ -1268,7 +1314,7 @@ something invalid
         // password SecretRef itself, into the world-readable option string.
         let secret = "onepassword://vault/smb-svc";
         let rendered = render(&smb_spec(
-            Some("vers=3.0,username=svc,domain=WORKGROUP,uid=1000"),
+            Some("vers=3.1.1,username=svc,domain=WORKGROUP,uid=1000"),
             Some(secret),
         ));
 
@@ -1286,7 +1332,7 @@ something invalid
         assert!(!rendered.contains(secret), "secret ref must not render");
         assert!(!rendered.contains("onepassword"), "no secret scheme leak");
         // Non-secret typed options still render.
-        assert!(rendered.contains("vers=3.0"));
+        assert!(rendered.contains("vers=3.1.1"));
         assert!(rendered.contains("uid=1000"));
     }
 
@@ -1302,25 +1348,25 @@ something invalid
     #[tokio::test]
     async fn validate_spec_backend_method_normalizes_to_raw() {
         let backend = SmbBackend::new("smb");
-        let spec = smb_spec(Some("vers=3.0,guest,uid=1000"), None);
+        let spec = smb_spec(Some("guest,allow_guest,uid=1000"), None);
         let normalized = backend.validate_spec(&spec).await.expect("validate");
         assert_eq!(
             normalized.options,
             OptionSet::Raw {
-                options: Some("vers=3.0,guest,uid=1000".into())
+                options: Some("guest,uid=1000,vers=3.1.1,seal".into())
             }
         );
         assert!(normalized.secret_file.is_none(), "guest has no secret-file");
         assert_eq!(
             backend.render_options(&normalized),
-            "vers=3.0,guest,uid=1000"
+            "guest,uid=1000,vers=3.1.1,seal"
         );
     }
 
     #[tokio::test]
     async fn validate_spec_backend_method_rejects_bad_vers() {
         let backend = SmbBackend::new("smb");
-        let spec = smb_spec(Some("vers=1.5,guest"), None);
+        let spec = smb_spec(Some("vers=1.5,guest,allow_guest"), None);
         assert!(backend.validate_spec(&spec).await.is_err());
     }
 

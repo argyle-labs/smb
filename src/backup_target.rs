@@ -49,6 +49,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,7 @@ use plugin_toolkit::abi::{BackendDef, DbOp, DbRow, DbValue};
 use plugin_toolkit::backend_def::backup_target_backend_def;
 use plugin_toolkit::backup::{dispatch_target_op, BackupTargetPlugin};
 use plugin_toolkit::contract::backup::BackupRecord;
+use plugin_toolkit::hash::sha256_file;
 use plugin_toolkit::path::expand_tilde;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde;
@@ -83,6 +85,7 @@ const INCOMING: &str = ".orca-incoming";
 const TRASH: &str = ".orca-trash";
 const MANIFEST: &str = "manifest.json";
 const PAYLOAD: &str = "payload";
+const FILE_HASHES: &str = "fileSha256";
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const RECONCILE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -322,9 +325,7 @@ pub(crate) fn prepare_stage(
                 ));
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(stage).map_err(|e| format!("create {}: {e}", stage.display()))?
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_private_dir(stage)?,
         Err(e) => return Err(format!("read {}: {e}", stage.display())),
     }
     write_atomic(&marker, b"")
@@ -341,6 +342,7 @@ impl StageLock {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
             .open(&path)
             .map_err(|e| format!("open {}: {e}", path.display()))?;
         let deadline = Instant::now() + timeout;
@@ -382,11 +384,23 @@ fn unique() -> String {
     format!("{}.{}", std::process::id(), plugin_toolkit::id::new())
 }
 
+fn create_private_dir(dir: &Path) -> Result<(), String> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("create {}: {e}", dir.display()))
+}
+
 /// Write via a same-dir temp file, fsync, rename, then fsync the dir.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(format!(".orca-tmp.{}", unique()));
-    let written = fs::File::create(&tmp)
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
         .and_then(|mut f| {
             f.write_all(bytes)?;
             f.sync_all()
@@ -664,6 +678,47 @@ fn local_payload_sizes(slot_dir: &Path) -> Result<BTreeMap<String, u64>, String>
     Ok(out)
 }
 
+fn payload_hashes(slot_dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    local_payload_sizes(slot_dir)?
+        .into_keys()
+        .map(|rel| {
+            let hex = sha256_file(&slot_dir.join(&rel)).map_err(|e| format!("hash {rel}: {e}"))?;
+            Ok((rel, hex))
+        })
+        .collect()
+}
+
+fn file_hashes(json: &str) -> Result<BTreeMap<String, String>, String> {
+    let obj = manifest_object(json)?;
+    let Some(Value::Object(map)) = obj.get(FILE_HASHES) else {
+        return Err(format!("manifest lacks `{FILE_HASHES}`"));
+    };
+    map.iter()
+        .map(|(k, v)| match v.as_str() {
+            Some(h) => Ok((k.clone(), h.to_string())),
+            None => Err(format!("manifest `{FILE_HASHES}.{k}` is not a string")),
+        })
+        .collect()
+}
+
+fn verify_hashes(json: &str, slot_dir: &Path) -> Result<(), String> {
+    if file_hashes(json)? != payload_hashes(slot_dir)? {
+        return Err("payload sha256 mismatch".into());
+    }
+    Ok(())
+}
+
+fn stamp_hashes(stage: &Path, slot: &str) -> Result<(), String> {
+    let mut obj = manifest_object(&read_local_manifest(stage, slot)?)?;
+    let hashes = payload_hashes(&stage.join(slot))?;
+    obj.insert(
+        FILE_HASHES.into(),
+        serde_json::to_value(hashes).map_err(|e| e.to_string())?,
+    );
+    let json = serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?;
+    write_atomic(&stage.join(slot).join(MANIFEST), json.as_bytes())
+}
+
 /// How a remote slot compares with the local slot at the same path.
 #[derive(Debug, PartialEq, Eq)]
 enum SlotMatch {
@@ -861,7 +916,7 @@ impl SlotRemote for RcloneRemote {
 fn delete_local_slot(stage: &Path, slot: &str) -> Result<(), String> {
     let dir = stage.join(slot);
     let trash = stage.join(TRASH);
-    fs::create_dir_all(&trash).map_err(|e| format!("create {}: {e}", trash.display()))?;
+    create_private_dir(&trash)?;
     let tag = unique();
     let manifest = trash.join(format!("{tag}.{MANIFEST}"));
     fs::rename(dir.join(MANIFEST), &manifest)
@@ -893,6 +948,7 @@ fn pull_into(
         match remote
             .manifest(slot)
             .and_then(|m| rewrite_manifest(&m, slot, &payload))
+            .and_then(|m| file_hashes(&m).map(|_| m))
         {
             Ok(json) => {
                 valid.insert(slot.clone(), json);
@@ -905,11 +961,14 @@ fn pull_into(
     }
     let incoming = stage.join(INCOMING);
     drop(fs::remove_dir_all(&incoming));
-    fs::create_dir_all(&incoming).map_err(|e| format!("create {}: {e}", incoming.display()))?;
+    create_private_dir(&incoming)?;
     let keys: BTreeSet<String> = valid.keys().cloned().collect();
     let result = remote.pull_payloads(&incoming, &keys).and_then(|()| {
         for (slot, json) in &valid {
-            install_pulled(stage, &incoming, slot, json)?;
+            match verify_hashes(json, &incoming.join(slot)) {
+                Ok(()) => install_pulled(stage, &incoming, slot, json)?,
+                Err(e) => rejected.push(format!("{slot}: {e}")),
+            }
         }
         Ok(())
     });
@@ -923,14 +982,13 @@ fn install_pulled(stage: &Path, incoming: &Path, slot: &str, json: &str) -> Resu
         // Became a local slot (e.g. a write in progress) since listing.
         return Ok(());
     }
-    fs::create_dir_all(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
+    create_private_dir(&dst)?;
     let src = incoming.join(slot).join(PAYLOAD);
     if src.is_dir() {
-        fs::rename(&src, dst.join(PAYLOAD))
+        fs::rename(&src, dst.join(PAYLOAD)).map_err(|e| format!("place {}: {e}", dst.display()))?;
     } else {
-        fs::create_dir(dst.join(PAYLOAD))
+        create_private_dir(&dst.join(PAYLOAD))?;
     }
-    .map_err(|e| format!("place {}: {e}", dst.display()))?;
     write_atomic(&dst.join(MANIFEST), json.as_bytes())
 }
 
@@ -992,8 +1050,16 @@ pub(crate) fn reconcile(
     for slot in &p.remote_delete {
         remote.remove(slot)?;
     }
+    let mut unhashed = BTreeSet::new();
+    for slot in p.push.iter().chain(&p.check) {
+        if let Err(e) = stamp_hashes(stage, slot) {
+            problems.push(format!("local slot {slot} not hashed: {e}"));
+            unhashed.insert(slot.clone());
+        }
+    }
+    let push = minus(&p.push, &unhashed);
     let mut conflicts = BTreeSet::new();
-    for slot in &p.check {
+    for slot in minus(&p.check, &unhashed).iter() {
         match same_slot(stage, slot, remote) {
             SlotMatch::Same => {}
             SlotMatch::Backfill(json) => {
@@ -1012,8 +1078,9 @@ pub(crate) fn reconcile(
         ));
     }
     excluded.extend(conflicts);
-    if !p.push.is_empty() {
-        remote.push(stage, &p.push)?;
+    excluded.extend(unhashed);
+    if !push.is_empty() {
+        remote.push(stage, &push)?;
     }
     for slot in &p.local_delete {
         delete_local_slot(stage, slot)?;
@@ -1046,7 +1113,7 @@ pub(crate) fn reconcile(
         return Err(problems.join("; "));
     }
     Ok(Outcome {
-        pushed: p.push.len(),
+        pushed: push.len(),
         purged: p.remote_delete.len(),
         dropped: p.local_delete.len(),
         pulled: pull.len(),
@@ -1434,7 +1501,11 @@ mod tests {
             system: String::new(),
             writer: None,
         };
-        serde_json::to_string_pretty(&rec).unwrap()
+        let mut v = serde_json::to_value(&rec).unwrap();
+        v[FILE_HASHES] = serde_json::json!({
+            "payload/save.dat": plugin_toolkit::hash::sha256_hex(body.as_bytes())
+        });
+        serde_json::to_string_pretty(&v).unwrap()
     }
 
     #[test]
@@ -2057,6 +2128,68 @@ mod tests {
         assert_eq!(local_manifest(&f.b, "g/1")["writer"]["host"], "bragi");
         assert_eq!(body(&f.b, "g/1"), "x");
         assert_eq!(body(&f.remote.root, "g/1"), "y");
+    }
+
+    #[test]
+    fn remote_slot_with_a_wrong_hash_is_not_pulled() {
+        let f = fleet();
+        write_slot(&f.remote.root, "g/1", "x");
+        fs::write(f.remote.root.join("g/1/payload/save.dat"), "y").unwrap();
+        write_slot(&f.remote.root, "g/2", "z");
+        let err = f.sync(&f.b).unwrap_err();
+        assert!(err.contains("g/1: payload sha256 mismatch"), "{err}");
+        assert!(!f.b.join("g/1").exists());
+        assert_eq!(committed(&f.b), set(&["g/2"]));
+    }
+
+    #[test]
+    fn remote_slot_without_hashes_is_not_pulled() {
+        let f = fleet();
+        write_slot(&f.remote.root, "g/1", "x");
+        let m = f.remote.root.join("g/1").join(MANIFEST);
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&m).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove(FILE_HASHES);
+        fs::write(&m, serde_json::to_string(&v).unwrap()).unwrap();
+        let err = f.sync(&f.b).unwrap_err();
+        assert!(err.contains(FILE_HASHES), "{err}");
+        assert!(!f.b.join("g/1").exists());
+    }
+
+    #[test]
+    fn push_stamps_per_file_hashes_into_the_manifest() {
+        let f = fleet();
+        write_slot(&f.a, "g/1", "x");
+        let m = f.a.join("g/1").join(MANIFEST);
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&m).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove(FILE_HASHES);
+        fs::write(&m, serde_json::to_string(&v).unwrap()).unwrap();
+        f.sync(&f.a).unwrap();
+        let want = plugin_toolkit::hash::sha256_hex(b"x");
+        for root in [&f.a, &f.remote.root] {
+            assert_eq!(
+                local_manifest(root, "g/1")[FILE_HASHES]["payload/save.dat"],
+                want
+            );
+        }
+        f.sync(&f.b).unwrap();
+        assert_eq!(body(&f.b, "g/1"), "x");
+    }
+
+    #[test]
+    fn stage_dirs_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        prepare_stage(&stage, &tmp.path().join("state"), &[]).unwrap();
+        assert_eq!(mode(&stage), 0o700);
+        assert_eq!(mode(&stage.join(STAGE_MARKER)), 0o600);
+        let f = fleet();
+        write_slot(&f.remote.root, "g/1", "x");
+        f.sync(&f.b).unwrap();
+        assert_eq!(mode(&f.b.join("g/1")), 0o700);
+        assert_eq!(mode(&f.b.join("g/1").join(MANIFEST)), 0o600);
+        assert_eq!(mode(&f.b.join(BASELINE)), 0o600);
     }
 
     #[test]
