@@ -161,11 +161,17 @@ impl SmbTargetConfig {
         Ok(cfg)
     }
 
-    pub fn password_ref(&self, name: &str) -> String {
-        self.password_secret
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| plugin_toolkit::secrets::scoped_name(TARGET_KIND, name, "password"))
+    pub fn password_ref(&self, name: &str) -> Result<plugin_toolkit::secrets::SecretRef, String> {
+        match self
+            .password_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => plugin_toolkit::secrets::SecretRef::from_stored(s),
+            None => plugin_toolkit::secrets::scoped_name(TARGET_KIND, name, "password")
+                .map_err(|e| format!("{e:#}")),
+        }
     }
 
     /// `smb://<host>/<share>[/<path>]` — identical on every host pointing at the
@@ -1150,12 +1156,21 @@ fn open_stage(name: &str) -> Result<(SmbTargetConfig, PathBuf), String> {
 impl SmbBackupTarget {
     fn reconcile_named(&self, name: &str) -> Result<(), String> {
         let (cfg, stage) = open_stage(name)?;
-        let password = plugin_toolkit::secrets::get_required(&cfg.password_ref(name))
-            .map_err(|e| format!("smb target `{name}`: {e:#}"))?;
+        let password = cfg
+            .password_ref(name)
+            .and_then(|r| {
+                plugin_toolkit::secrets::get_required(r.as_str()).map_err(|e| format!("{e:#}"))
+            })
+            .map_err(|e| format!("smb target `{name}`: {e}"))?;
         let deadline = Instant::now() + RECONCILE_TIMEOUT;
         let remote = RcloneRemote {
-            rclone: Rclone::connect(rclone::resolve()?, &cfg.host, &cfg.user, &password)?
-                .with_deadline(deadline),
+            rclone: Rclone::connect(
+                rclone::resolve()?,
+                &cfg.host,
+                &cfg.user,
+                password.expose_secret(),
+            )?
+            .with_deadline(deadline),
             root: cfg.remote_root(),
         };
         let binding = Binding {
@@ -1242,7 +1257,10 @@ mod tests {
         assert_eq!(cfg.host, "10.0.0.10");
         assert_eq!(cfg.share, "backups");
         assert_eq!(cfg.path, "game-saves");
-        assert_eq!(cfg.password_ref("x"), "smb.saves.password");
+        assert_eq!(
+            cfg.password_ref("x").unwrap().as_str(),
+            "smb.saves.password"
+        );
         assert_eq!(
             cfg.stage_dir("x", Path::new("/s")).unwrap(),
             PathBuf::from("/var/stage")
@@ -1250,7 +1268,10 @@ mod tests {
 
         let min = SmbTargetConfig::parse(r#"{"host":"h","share":"backups","user":"u"}"#).unwrap();
         assert_eq!(min.path, "");
-        assert_eq!(min.password_ref("saves"), "smb.saves.password");
+        assert_eq!(
+            min.password_ref("saves").unwrap().as_str(),
+            "smb.saves.password"
+        );
         assert_eq!(
             min.stage_dir("saves", Path::new("/home/u/.orca")).unwrap(),
             PathBuf::from("/home/u/.orca/backup-stage/smb-saves")
