@@ -34,7 +34,7 @@ path = "src/main.rs"
 [dependencies]
 # Tracks orca `main` via the public GitHub git source; the committed Cargo.lock
 # pins the resolved commit and CI builds `--locked`.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db"] }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness probes mount health against a `tempfile`
@@ -48,3 +48,10 @@ tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 # too — the plugin must stay portable back into the orca workspace.
 [lints.clippy]
 let_underscore_must_use = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
