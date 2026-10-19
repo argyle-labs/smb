@@ -584,7 +584,7 @@ fn build_secret_file(o: &SmbOptions, target: &str) -> Option<SecretFile> {
     else {
         return None;
     };
-    let plaintext = match plugin_toolkit::secrets::get_required(&password.0) {
+    let plaintext = match plugin_toolkit::secrets::get_required(password.as_str()) {
         Ok(p) => p,
         Err(_) => return None, // fail closed — never log the ref's value
     };
@@ -594,7 +594,7 @@ fn build_secret_file(o: &SmbOptions, target: &str) -> Option<SecretFile> {
     }
     Some(SecretFile {
         path,
-        contents: render_creds_file(username, &plaintext, domain.as_deref()),
+        contents: render_creds_file(username, plaintext.expose_secret(), domain.as_deref()),
     })
 }
 
@@ -1158,7 +1158,7 @@ something invalid
             source: "//nas/media".into(),
             failover_sources: vec![],
             options: options.map(str::to_string),
-            credential: credential.map(|s| SecretRef(s.to_string())),
+            credential: credential.map(|s| SecretRef::parse(s).unwrap()),
             remount_policy: None,
             enabled: true,
         }
@@ -1266,7 +1266,10 @@ something invalid
                 domain,
             } => {
                 assert_eq!(username, "svc");
-                assert_eq!(password, SecretRef("onepassword://vault/item".into()));
+                assert_eq!(
+                    password,
+                    SecretRef::parse("onepassword://vault/item").unwrap()
+                );
                 assert_eq!(domain.as_deref(), Some("WORKGROUP"));
             }
             other => panic!("expected Inline credentials, got {other:?}"),
