@@ -1325,6 +1325,22 @@ something invalid
     }
 
     #[test]
+    fn render_passes_nosharesock_through() {
+        let rendered = render(&smb_spec(
+            Some("vers=3.1.1,username=orca,nosharesock,actimeo=1"),
+            Some("secret://x"),
+        ));
+        assert!(
+            rendered.split(',').any(|o| o == "nosharesock"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.split(',').any(|o| o == "actimeo=1"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
     fn render_file_credentials_references_the_path() {
         let rendered = render(&smb_spec(
             Some("vers=3.1.1,credentials=/etc/smb.creds,uid=1000,noperm"),
