@@ -32,9 +32,7 @@ path = "src/main.rs"
 # owns its own SMB option + credential grammar and hands core only the opaque
 # `OptionSet::Raw` string plus a generic `SecretFile`.
 [dependencies]
-# Tracks orca `main` via the public GitHub git source; the committed Cargo.lock
-# pins the resolved commit and CI builds `--locked`.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db"] }
+plugin-toolkit = { version = "=0.2.1-rc.39", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db"] }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness probes mount health against a `tempfile`
