@@ -412,6 +412,17 @@ pub fn validate_smb_options(spec: &StorageMountSpec) -> Result<SmbOptions, Stora
             ("gid", Some(v)) => gid = Some(v),
             ("iocharset", Some(v)) => iocharset = Some(v),
             ("noperm", None) => noperm = true,
+            ("nosharesock", Some(v)) => {
+                return Err(StorageError::Other(format!(
+                    "smb: `nosharesock` takes no value (got `nosharesock={v}`); it is always set"
+                )));
+            }
+            ("sharesock", _) => {
+                return Err(StorageError::Other(
+                    "smb: `sharesock` is not a cifs option; `nosharesock` is always set"
+                        .to_string(),
+                ));
+            }
             // Unknown-but-legal option: preserve it verbatim, order-stable.
             (k, v) => extra.push(match v {
                 Some(v) => format!("{k}={v}"),
@@ -1348,6 +1359,21 @@ something invalid
         ] {
             let rendered = render(&smb_spec(Some(options), credential));
             assert_eq!(sharesocks(&rendered), 1, "{options}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_valued_nosharesock_and_sharesock() {
+        for (raw, want) in [
+            ("credentials=/etc/c,nosharesock=0", "takes no value"),
+            ("credentials=/etc/c,NOSHARESOCK=yes", "takes no value"),
+            ("credentials=/etc/c,sharesock", "not a cifs option"),
+            ("credentials=/etc/c,sharesock=1", "not a cifs option"),
+        ] {
+            let err = validate_smb_options(&smb_spec(Some(raw), None))
+                .expect_err(raw)
+                .to_string();
+            assert!(err.contains(want), "{raw}: {err}");
         }
     }
 
