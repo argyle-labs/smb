@@ -60,6 +60,8 @@ pub enum SmbError {
     Timeout(Duration),
     #[orca(display = "unsupported on this platform")]
     Unsupported,
+    #[orca(display = "invalid smb mount options: {0}")]
+    InvalidOptions(String),
 }
 
 /// One share advertised by a server.
@@ -126,7 +128,7 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
     #[cfg(target_os = "linux")]
     {
         which("mount.cifs").ok_or(SmbError::MissingTool("mount.cifs"))?;
-        let opts = cifs_mount_opts(&spec);
+        let opts = cifs_mount_opts(&spec)?;
         let source = format!("//{}/{}", spec.server, spec.share);
         run_tool(
             "mount.cifs",
@@ -134,7 +136,7 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
                 source.as_str(),
                 spec.mountpoint.to_str().unwrap_or(""),
                 "-o",
-                opts.join(",").as_str(),
+                opts.as_str(),
             ],
         )
         .await
@@ -142,6 +144,7 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
     #[cfg(target_os = "macos")]
     {
         which("mount_smbfs").ok_or(SmbError::MissingTool("mount_smbfs"))?;
+        smbfs_check(&spec)?;
         let url = format!("//{}/{}", spec.server, spec.share);
         run_tool(
             "mount_smbfs",
@@ -156,15 +159,47 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
     }
 }
 
-pub fn cifs_mount_opts(spec: &MountSpec<'_>) -> Vec<String> {
+pub fn cifs_mount_opts(spec: &MountSpec<'_>) -> Result<String, SmbError> {
     let mut opts: Vec<String> = Vec::new();
     match &spec.credentials {
         Credentials::File(p) => opts.push(format!("credentials={}", p.display())),
-        Credentials::Guest => opts.push("guest".to_string()),
+        Credentials::Guest => opts.extend(["guest".to_string(), "allow_guest".to_string()]),
     }
     opts.extend(spec.extra_opts.iter().cloned());
-    apply_option_floor(&mut opts, SMB_MANDATORY, &[]);
-    opts
+    let target = spec.mountpoint.to_string_lossy().into_owned();
+    let storage = StorageMountSpec {
+        backend: "smb".into(),
+        target: target.clone(),
+        fstype: "cifs".into(),
+        source: format!("//{}/{}", spec.server, spec.share),
+        failover_sources: vec![],
+        options: Some(opts.join(",")),
+        credential: None,
+        remount_policy: None,
+        enabled: true,
+    };
+    let o = validate_smb_options(&storage).map_err(|e| SmbError::InvalidOptions(e.to_string()))?;
+    if matches!(o.credentials, SmbCredentials::Inline { .. }) {
+        return Err(SmbError::InvalidOptions(
+            "username/domain need a credentials file on a direct mount".to_string(),
+        ));
+    }
+    Ok(render_smb_options(&o, &target))
+}
+
+pub fn smbfs_check(spec: &MountSpec<'_>) -> Result<(), SmbError> {
+    if matches!(spec.credentials, Credentials::File(_)) {
+        return Err(SmbError::InvalidOptions(
+            "mount_smbfs cannot take a credentials file".to_string(),
+        ));
+    }
+    if !spec.extra_opts.is_empty() {
+        return Err(SmbError::InvalidOptions(format!(
+            "mount_smbfs cannot take these options: {}",
+            spec.extra_opts.join(",")
+        )));
+    }
+    Ok(())
 }
 
 /// Unmount a previously-mounted share.
@@ -1387,29 +1422,59 @@ something invalid
         assert_eq!(sharesocks(&render_checked(&normalized(&again)).unwrap()), 1);
     }
 
+    fn direct(credentials: Credentials, extra: &[&str]) -> MountSpec<'static> {
+        MountSpec {
+            server: "nas",
+            share: "media",
+            mountpoint: Path::new("/mnt/x"),
+            credentials,
+            extra_opts: extra.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     #[test]
-    fn direct_mount_options_carry_nosharesock() {
-        let mountpoint = Path::new("/mnt/x");
-        for (credentials, extra) in [
-            (Credentials::Guest, vec![]),
-            (
-                Credentials::File(PathBuf::from("/etc/c")),
-                vec!["vers=3.0".to_string(), "nosharesock".to_string()],
-            ),
+    fn direct_mount_options_go_through_the_renderer() {
+        let file = || Credentials::File(PathBuf::from("/etc/c"));
+        assert_eq!(
+            cifs_mount_opts(&direct(Credentials::Guest, &[])).unwrap(),
+            "guest,vers=3.1.1,seal,nosharesock"
+        );
+        assert_eq!(
+            cifs_mount_opts(&direct(file(), &["uid=1000", "nosharesock"])).unwrap(),
+            "credentials=/etc/c,uid=1000,nosharesock,vers=3.1.1,seal"
+        );
+        assert_eq!(
+            cifs_mount_opts(&direct(file(), &["vers=3.0", "allow_weak_transport"])).unwrap(),
+            "vers=3.0,credentials=/etc/c,nosharesock"
+        );
+        for weak in [
+            &["vers=3.0"][..],
+            &["sec=ntlm"],
+            &["noseal"],
+            &["password=x"],
+            &["username=u"],
         ] {
-            let opts = cifs_mount_opts(&MountSpec {
-                server: "nas",
-                share: "media",
-                mountpoint,
-                credentials,
-                extra_opts: extra,
-            });
-            assert_eq!(
-                opts.iter().filter(|o| *o == "nosharesock").count(),
-                1,
-                "{opts:?}"
+            let err = cifs_mount_opts(&direct(file(), weak))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with("invalid smb mount options"),
+                "{weak:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn smbfs_refuses_what_it_would_drop() {
+        smbfs_check(&direct(Credentials::Guest, &[])).unwrap();
+        let err = smbfs_check(&direct(Credentials::File(PathBuf::from("/etc/c")), &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credentials file"), "{err}");
+        let err = smbfs_check(&direct(Credentials::Guest, &["uid=1000"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uid=1000"), "{err}");
     }
 
     #[test]
