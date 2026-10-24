@@ -126,12 +126,7 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
     #[cfg(target_os = "linux")]
     {
         which("mount.cifs").ok_or(SmbError::MissingTool("mount.cifs"))?;
-        let mut opts: Vec<String> = Vec::new();
-        match &spec.credentials {
-            Credentials::File(p) => opts.push(format!("credentials={}", p.display())),
-            Credentials::Guest => opts.push("guest".to_string()),
-        }
-        opts.extend(spec.extra_opts.iter().cloned());
+        let opts = cifs_mount_opts(&spec);
         let source = format!("//{}/{}", spec.server, spec.share);
         run_tool(
             "mount.cifs",
@@ -159,6 +154,17 @@ pub async fn mount(spec: MountSpec<'_>) -> Result<(), SmbError> {
         let _ = spec;
         Err(SmbError::Unsupported)
     }
+}
+
+pub fn cifs_mount_opts(spec: &MountSpec<'_>) -> Vec<String> {
+    let mut opts: Vec<String> = Vec::new();
+    match &spec.credentials {
+        Credentials::File(p) => opts.push(format!("credentials={}", p.display())),
+        Credentials::Guest => opts.push("guest".to_string()),
+    }
+    opts.extend(spec.extra_opts.iter().cloned());
+    apply_option_floor(&mut opts, SMB_MANDATORY, &[]);
+    opts
 }
 
 /// Unmount a previously-mounted share.
@@ -257,6 +263,8 @@ pub const SMB_WEAK_SEC: &[&str] = &[
 ];
 
 pub const SMB_WEAK_FLAGS: &[&str] = &["noseal", "nosign"];
+
+pub const SMB_MANDATORY: &[(&str, &str)] = &[("nosharesock", "nosharesock")];
 
 pub const SMB_REJECTED_RENDER: &str = "vers=orca-rejected,seal";
 
@@ -547,6 +555,7 @@ pub fn render_smb_options(o: &SmbOptions, target: &str) -> String {
     if !o.allow_weak_transport {
         apply_option_floor(&mut parts, &[("vers", "vers=3.1.1"), ("seal", "seal")], &[]);
     }
+    apply_option_floor(&mut parts, SMB_MANDATORY, &[]);
     parts.join(",")
 }
 
@@ -1228,14 +1237,14 @@ something invalid
     fn render_applies_transport_floor() {
         assert_eq!(
             render(&smb_spec(Some("credentials=/etc/c"), None)),
-            "credentials=/etc/c,vers=3.1.1,seal"
+            "credentials=/etc/c,vers=3.1.1,seal,nosharesock"
         );
         assert_eq!(
             render(&smb_spec(
                 Some("vers=3.0,credentials=/etc/c,allow_weak_transport"),
                 None
             )),
-            "vers=3.0,credentials=/etc/c"
+            "vers=3.0,credentials=/etc/c,nosharesock"
         );
     }
 
@@ -1324,20 +1333,57 @@ something invalid
         assert!(set.extra.contains(&"cache=strict".to_string()));
     }
 
+    fn sharesocks(rendered: &str) -> usize {
+        rendered.split(',').filter(|o| *o == "nosharesock").count()
+    }
+
     #[test]
-    fn render_passes_nosharesock_through() {
-        let rendered = render(&smb_spec(
-            Some("vers=3.1.1,username=orca,nosharesock,actimeo=1"),
-            Some("secret://x"),
-        ));
-        assert!(
-            rendered.split(',').any(|o| o == "nosharesock"),
-            "got: {rendered}"
-        );
-        assert!(
-            rendered.split(',').any(|o| o == "actimeo=1"),
-            "got: {rendered}"
-        );
+    fn nosharesock_is_always_rendered_exactly_once() {
+        for (options, credential) in [
+            ("vers=3.1.1,username=orca,actimeo=1", Some("secret://x")),
+            ("vers=3.1.1,credentials=/etc/smb.creds", None),
+            ("vers=3.1.1,guest,allow_guest", None),
+            ("vers=3.0,credentials=/etc/c,allow_weak_transport", None),
+            ("vers=3.1.1,credentials=/etc/c,nosharesock", None),
+        ] {
+            let rendered = render(&smb_spec(Some(options), credential));
+            assert_eq!(sharesocks(&rendered), 1, "{options}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn render_options_keeps_nosharesock_and_is_idempotent() {
+        let backend = SmbBackend::new("smb");
+        let first = backend.render_options(&normalized("vers=3.1.1,credentials=/etc/c,uid=1000"));
+        assert_eq!(sharesocks(&first), 1, "{first}");
+        let again = backend.render_options(&normalized(&first));
+        assert_eq!(again, first);
+        assert_eq!(sharesocks(&render_checked(&normalized(&again)).unwrap()), 1);
+    }
+
+    #[test]
+    fn direct_mount_options_carry_nosharesock() {
+        let mountpoint = Path::new("/mnt/x");
+        for (credentials, extra) in [
+            (Credentials::Guest, vec![]),
+            (
+                Credentials::File(PathBuf::from("/etc/c")),
+                vec!["vers=3.0".to_string(), "nosharesock".to_string()],
+            ),
+        ] {
+            let opts = cifs_mount_opts(&MountSpec {
+                server: "nas",
+                share: "media",
+                mountpoint,
+                credentials,
+                extra_opts: extra,
+            });
+            assert_eq!(
+                opts.iter().filter(|o| *o == "nosharesock").count(),
+                1,
+                "{opts:?}"
+            );
+        }
     }
 
     #[test]
@@ -1348,7 +1394,7 @@ something invalid
         ));
         assert_eq!(
             rendered,
-            "vers=3.1.1,credentials=/etc/smb.creds,uid=1000,noperm,seal"
+            "vers=3.1.1,credentials=/etc/smb.creds,uid=1000,noperm,seal,nosharesock"
         );
     }
 
@@ -1356,7 +1402,7 @@ something invalid
     fn render_guest_emits_guest() {
         assert_eq!(
             render(&smb_spec(Some("vers=3.1.1,guest,allow_guest"), None)),
-            "vers=3.1.1,guest,seal"
+            "vers=3.1.1,guest,seal,nosharesock"
         );
     }
 
@@ -1406,7 +1452,7 @@ something invalid
         assert_eq!(
             normalized.options,
             OptionSet::Raw {
-                options: Some("guest,uid=1000,vers=3.1.1,seal".into())
+                options: Some("guest,uid=1000,vers=3.1.1,seal,nosharesock".into())
             }
         );
         assert!(normalized.secret_file.is_none(), "guest has no secret-file");
@@ -1416,7 +1462,7 @@ something invalid
         let normalized = backend.validate_spec(&spec).await.expect("validate");
         assert_eq!(
             backend.render_options(&normalized),
-            "vers=3.1.1,credentials=/etc/c,uid=1000,seal"
+            "vers=3.1.1,credentials=/etc/c,uid=1000,seal,nosharesock"
         );
     }
 
