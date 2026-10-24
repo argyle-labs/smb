@@ -32,7 +32,7 @@ path = "src/main.rs"
 # owns its own SMB option + credential grammar and hands core only the opaque
 # `OptionSet::Raw` string plus a generic `SecretFile`.
 [dependencies]
-plugin-toolkit = { version = "=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db"] }
+plugin-toolkit = { version = ">=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db"] }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness probes mount health against a `tempfile`
